@@ -37,6 +37,7 @@ class StockEvaluation(BaseModel):
     strengths: list[str]
     risks: list[str]
     model: str
+    sources: list[str] = Field(default_factory=list)
 
     @field_validator("score", mode="before")
     @classmethod

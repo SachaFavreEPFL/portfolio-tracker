@@ -3,6 +3,7 @@ import logging
 import os
 import time
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -124,18 +125,66 @@ def resolve_gemini_api_key(
     return resolved
 
 
-def _build_evaluation_prompt(stock: StockData) -> str:
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _build_evaluation_prompt(
+    stock: StockData,
+    *,
+    analysis_date: str | None = None,
+) -> str:
     stock_json = json.dumps(stock.model_dump(mode="json"), indent=2, ensure_ascii=False)
+    date_line = f"Date d'analyse : {analysis_date}\n" if analysis_date else ""
     return (
-        "Tu es un analyste financier rigoureux. Évalue l'action ci-dessous à partir "
-        "uniquement des données fournies et réponds en français au format JSON structuré.\n"
+        "Tu es un analyste financier rigoureux. Évalue l'action ci-dessous en croisant "
+        "les données financières fournies avec une recherche Google sur son actualité récente "
+        "(derniers résultats trimestriels, guidance, annonces stratégiques ou produits, "
+        "risques réglementaires ou géopolitiques, mouvements récents du cours) "
+        "et réponds en français au format JSON structuré.\n"
+        "Les données financières fournies peuvent refléter des résultats passés avec du retard : "
+        "pondère ton verdict et ton score si l'actualité récente remet en cause la dynamique historique.\n"
+        f"{date_line}"
         "- verdict : exactement une valeur parmi ACHAT, CONSERVER ou VENDRE.\n"
         "- score : entier compris entre 1 (très défavorable) et 10 (très favorable).\n"
-        "- summary : synthèse concise et factuelle de la situation de l'action.\n"
+        "- summary : synthèse concise et factuelle intégrant fondamentaux et actualité récente.\n"
         "- strengths : liste des principaux points forts observables.\n"
         "- risks : liste des principaux risques ou points de vigilance.\n\n"
         f"Données de l'action :\n{stock_json}"
     )
+
+
+def _extract_grounding_sources(response: dict[str, Any]) -> list[str]:
+    """Extrait et déduplique les sources web citées dans groundingMetadata."""
+    candidates = response.get("candidates")
+    if not isinstance(candidates, list) or not candidates or not isinstance(candidates[0], dict):
+        return []
+    metadata = candidates[0].get("groundingMetadata")
+    if not isinstance(metadata, dict):
+        return []
+    chunks = metadata.get("groundingChunks")
+    if not isinstance(chunks, list):
+        return []
+
+    sources: list[str] = []
+    seen: set[str] = set()
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        web = chunk.get("web")
+        if not isinstance(web, dict):
+            continue
+        raw_uri = web.get("uri")
+        if not isinstance(raw_uri, str) or not raw_uri.strip():
+            continue
+        uri = raw_uri.strip()
+        raw_title = web.get("title")
+        title = raw_title.strip() if isinstance(raw_title, str) and raw_title.strip() else None
+        entry = f"{title} ({uri})" if title else uri
+        if entry not in seen:
+            seen.add(entry)
+            sources.append(entry)
+    return sources
 
 
 def _extract_candidate_text(
@@ -208,6 +257,7 @@ class GeminiStockEvaluator(StockEvaluator):
         env_path: Path | None = None,
         api_base_url: str = DEFAULT_GEMINI_API_BASE_URL,
         timeout: int = DEFAULT_TIMEOUT_SECONDS,
+        clock: Callable[[], datetime] = _utc_now,
     ) -> None:
         self._api_key = resolve_gemini_api_key(api_key=api_key, env_path=env_path)
         cleaned_model = model.strip()
@@ -223,17 +273,27 @@ class GeminiStockEvaluator(StockEvaluator):
         self._http_client = http_client
         self._api_base_url = cleaned_base_url
         self._timeout = timeout
+        self._clock = clock
 
     def evaluate(self, stock: StockData) -> StockEvaluation:
         url = f"{self._api_base_url}/models/{self._model}:generateContent"
         headers = {"x-goog-api-key": self._api_key}
+        analysis_date = self._clock().date().isoformat()
         payload: dict[str, Any] = {
             "contents": [
                 {
                     "role": "user",
-                    "parts": [{"text": _build_evaluation_prompt(stock)}],
+                    "parts": [
+                        {
+                            "text": _build_evaluation_prompt(
+                                stock,
+                                analysis_date=analysis_date,
+                            )
+                        }
+                    ],
                 }
             ],
+            "tools": [{"google_search": {}}],
             "generationConfig": {
                 "responseMimeType": "application/json",
                 "responseSchema": _EVALUATION_RESPONSE_SCHEMA,
@@ -258,6 +318,7 @@ class GeminiStockEvaluator(StockEvaluator):
             )
 
         raw_text = _extract_candidate_text(response, stock.symbol, secret=self._api_key)
+        sources = _extract_grounding_sources(response)
 
         try:
             parsed = json.loads(raw_text)
@@ -275,6 +336,7 @@ class GeminiStockEvaluator(StockEvaluator):
             **parsed,
             "symbol": stock.symbol,
             "model": self._model,
+            "sources": sources,
         }
         try:
             return StockEvaluation.model_validate(evaluation_data)

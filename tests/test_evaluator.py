@@ -950,3 +950,64 @@ def test_evaluate_reports_block_reason_and_non_stop_finish_reason(
 
     with pytest.raises(EvaluationError, match=expected_fragment):
         evaluator.evaluate(_sample_stock())
+
+
+# --- 7. Recherche Google (grounding) et extraction des sources ---
+
+
+def test_evaluate_enables_google_search_by_default_and_extracts_sources() -> None:
+    from datetime import UTC, datetime
+
+    captured: dict[str, Any] = {}
+    api_response: dict[str, Any] = {
+        "candidates": [
+            {
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {
+                            "text": json.dumps(
+                                _valid_evaluation_payload(sources=["https://hallucinated.invalid"])
+                            )
+                        }
+                    ],
+                },
+                "groundingMetadata": {
+                    "groundingChunks": [
+                        {"web": {"title": "Reuters", "uri": "https://reuters.com/nvda"}},
+                        {"web": {"title": "Reuters", "uri": "https://reuters.com/nvda"}},
+                        {"web": {"uri": "https://bloomberg.com/nvda"}},
+                        {"web": {"title": "No URI"}},
+                        "invalid-chunk",
+                    ]
+                },
+            }
+        ]
+    }
+
+    def fake_http_client(
+        url: str,
+        payload: dict[str, Any],
+        headers: dict[str, str],
+        timeout: int,
+    ) -> dict[str, Any]:
+        captured["payload"] = payload
+        return api_response
+
+    evaluator = GeminiStockEvaluator(
+        api_key="test-key",
+        http_client=fake_http_client,
+        clock=lambda: datetime(2026, 11, 21, 12, 0, tzinfo=UTC),
+    )
+
+    result = evaluator.evaluate(_sample_stock())
+
+    assert captured["payload"]["tools"] == [{"google_search": {}}]
+    prompt_text = captured["payload"]["contents"][0]["parts"][0]["text"]
+    assert "2026-11-21" in prompt_text
+    assert "recherche Google" in prompt_text
+    assert "actualité récente" in prompt_text
+    assert result.sources == [
+        "Reuters (https://reuters.com/nvda)",
+        "https://bloomberg.com/nvda",
+    ]
