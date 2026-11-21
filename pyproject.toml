@@ -27,6 +27,10 @@ pythonpath = ["src", "."]
 line-length = 100
 target-version = "py311"
 
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+ignore = ["E501"]
+
 [tool.mypy]
 python_version = "3.11"
 mypy_path = "src"

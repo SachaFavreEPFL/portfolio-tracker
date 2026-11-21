@@ -1,26 +1,28 @@
 #!/usr/bin/env python3
-"""Point d'entrée CLI du harness d'agents (Ollama local & Gemini API)."""
+"""Point d'entrée CLI du harness d'agents (Gemini API)."""
 
 import argparse
-from pathlib import Path
+import os
 import sys
-import urllib.error
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
 
-from harness.providers import DEFAULT_OLLAMA_URL, LLMProvider, create_provider  # noqa: E402
+if __name__ == "__main__":
+    if VENV_PYTHON.exists() and Path(sys.prefix).resolve() != (ROOT / ".venv").resolve():
+        os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
+
+for entry in (str(ROOT / "src"), str(ROOT)):
+    if entry not in sys.path:
+        sys.path.insert(0, entry)
+
+from harness.providers import LLMProvider, ProviderError, create_provider  # noqa: E402
 from harness.roles import ROLES, get_role  # noqa: E402
 from harness.runner import run_agent  # noqa: E402
 
 
-def _parse_role_models(
-    entries: list[str],
-    *,
-    ollama_url: str,
-    think: bool,
-) -> dict[str, LLMProvider]:
+def _parse_role_models(entries: list[str]) -> dict[str, LLMProvider]:
     """Parse les options --role-model ROLE=MODELE en fournisseurs dédiés."""
     providers: dict[str, LLMProvider] = {}
     for entry in entries:
@@ -32,17 +34,13 @@ def _parse_role_models(
         get_role(role_name)
         if not model_name:
             raise ValueError(f"Nom de modèle manquant pour le rôle '{role_name}'.")
-        providers[role_name] = create_provider(
-            model_name,
-            ollama_url=ollama_url,
-            think=think,
-        )
+        providers[role_name] = create_provider(model_name)
     return providers
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Harness d'agents modulaires (Ollama local ou Gemini API)."
+        description="Harness d'agents modulaires (Gemini API)."
     )
     parser.add_argument(
         "--agent",
@@ -60,7 +58,7 @@ def main() -> int:
         "--model",
         "-m",
         default=None,
-        help="Modèle à utiliser (ex. qwen3.8, gemini-4-hydrogen, gemini-4-neon).",
+        help="Modèle Gemini à utiliser (ex. gemini-4-hydrogen, gemini-4-neon).",
     )
     parser.add_argument(
         "--role-model",
@@ -70,20 +68,10 @@ def main() -> int:
         help="Modèle spécifique pour un sous-agent (répétable, ex. --role-model coder=gemini-4-hydrogen).",
     )
     parser.add_argument(
-        "--url",
-        default=DEFAULT_OLLAMA_URL,
-        help="URL du serveur Ollama local.",
-    )
-    parser.add_argument(
         "--max-steps",
         type=int,
         default=15,
         help="Nombre maximal d'itérations d'outils (défaut : 15).",
-    )
-    parser.add_argument(
-        "--no-think",
-        action="store_true",
-        help="Désactive le mode thinking sur Ollama.",
     )
     parser.add_argument(
         "--quiet",
@@ -91,19 +79,11 @@ def main() -> int:
         action="store_true",
         help="Masque le détail des appels d'outils sur stderr.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     try:
-        provider = create_provider(
-            args.model,
-            ollama_url=args.url,
-            think=not args.no_think,
-        )
-        role_providers = _parse_role_models(
-            args.role_model,
-            ollama_url=args.url,
-            think=not args.no_think,
-        )
+        provider = create_provider(args.model)
+        role_providers = _parse_role_models(args.role_model)
         print(f"Rôle : {args.agent} | Modèle : {provider.model}", file=sys.stderr)
         if role_providers:
             overrides_str = ", ".join(f"{r}={p.model}" for r, p in role_providers.items())
@@ -141,12 +121,8 @@ def main() -> int:
                 role_providers=role_providers,
             )
             print(result.output)
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        print(f"Erreur HTTP {exc.code} : {body}", file=sys.stderr)
-        return 1
-    except urllib.error.URLError as exc:
-        print(f"Impossible de joindre le serveur : {exc.reason}", file=sys.stderr)
+    except ProviderError as exc:
+        print(f"Erreur fournisseur : {exc}", file=sys.stderr)
         return 1
     except Exception as exc:
         print(f"Erreur : {exc}", file=sys.stderr)

@@ -460,3 +460,124 @@ def test_orchestrator_enforces_delegation_and_global_step_budgets(tmp_path: Path
         verbose=False,
     )
     assert exhausted.status == "budget_exhausted"
+
+
+def test_run_agent_sanitizes_and_closes_raw_http_error_before_logging(tmp_path: Path) -> None:
+    import io
+    import urllib.error
+    from http.client import HTTPMessage
+
+    secret = "secret-runner-api-key-789"
+    stream = io.BytesIO(
+        json.dumps({"error": {"message": f"Invalid key {secret}"}}).encode("utf-8")
+    )
+    log_file = tmp_path / "runs.jsonl"
+
+    class _RawHTTPErrorSession:
+        def next_turn(self) -> ProviderResponse:
+            raise urllib.error.HTTPError(
+                url="https://api.example.test/interactions",
+                code=401,
+                msg="Unauthorized",
+                hdrs=HTTPMessage(),
+                fp=stream,
+            )
+
+        def add_tool_result(self, call: ToolCall, result: str) -> None:
+            pass
+
+    class _RawHTTPErrorProvider:
+        model = "gemini-4-neon"
+        _api_key = secret
+
+        def start_session(
+            self,
+            system_prompt: str,
+            user_prompt: str,
+            tools: list[dict[str, Any]],
+        ) -> _RawHTTPErrorSession:
+            return _RawHTTPErrorSession()
+
+    with pytest.raises(ProviderError) as exc_info:
+        run_agent(
+            "Audite",
+            role_name="audit",
+            provider=_RawHTTPErrorProvider(),
+            root=tmp_path,
+            log_path=log_file,
+            verbose=False,
+        )
+
+    assert secret not in str(exc_info.value)
+    assert "Invalid key ***" in str(exc_info.value)
+    assert stream.closed
+
+    log_entry = json.loads(log_file.read_text(encoding="utf-8").strip())
+    assert log_entry["status"] == "error"
+    assert secret not in json.dumps(log_entry)
+
+
+def test_run_agent_does_not_reset_loop_epoch_on_failed_edit_or_non_mutating_delegation(
+    tmp_path: Path,
+) -> None:
+    log_file = tmp_path / "runs.jsonl"
+    check_call = ToolCall(id="c", name="run_checks", arguments={})
+    failed_edit = ToolCall(
+        id="e",
+        name="edit_file",
+        arguments={"path": "src/succès.py", "target": "x = 1", "replacement": "x = 2"},
+    )
+    provider = _FakeProvider(
+        [
+            [
+                ProviderResponse(text="", tool_calls=[check_call]),
+                ProviderResponse(text="", tool_calls=[failed_edit]),
+                ProviderResponse(text="", tool_calls=[check_call]),
+                ProviderResponse(text="", tool_calls=[check_call]),
+            ]
+        ]
+    )
+
+    with patch("harness.tools.ToolBox._run_checks", return_value="code=1"):
+        result = run_agent(
+            "Corrige succès.py",
+            role_name="coder",
+            provider=provider,
+            root=tmp_path,
+            log_path=log_file,
+            verbose=False,
+        )
+
+    assert result.status == "loop_detected"
+    assert not result.mutated
+
+    # Vérifie aussi qu'une délégation à 'coder' qui ne modifie aucun fichier ne réinitialise pas l'époque.
+    delegate_noop = ToolCall(
+        id="d",
+        name="delegate_to_agent",
+        arguments={"agent_name": "coder", "task": "Inspecte sans éditer"},
+    )
+    orch_provider = _FakeProvider(
+        [
+            [
+                ProviderResponse(text="", tool_calls=[check_call]),
+                ProviderResponse(text="", tool_calls=[delegate_noop]),
+                ProviderResponse(text="", tool_calls=[check_call]),
+                ProviderResponse(text="", tool_calls=[check_call]),
+            ],
+            [ProviderResponse(text="Rien à modifier.")],
+        ]
+    )
+
+    with patch("harness.tools.ToolBox._run_checks", return_value="code=1"):
+        orch_result = run_agent(
+            "Vérifie en boucle",
+            role_name="orchestrator",
+            provider=orch_provider,
+            root=tmp_path,
+            log_path=log_file,
+            verbose=False,
+        )
+
+    assert orch_result.status == "loop_detected"
+    assert not orch_result.mutated

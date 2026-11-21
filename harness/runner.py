@@ -1,19 +1,19 @@
 """Boucle d'exécution agentique avec garde-fous et journalisation JSONL."""
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
+import http.client
 import json
-from pathlib import Path
 import sys
 import time
-from typing import Any
 import urllib.error
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
 
+from harness._http import extract_http_error_detail, sanitize_error_message
 from harness.providers import LLMProvider, ProviderError
 from harness.roles import build_system_prompt, get_role
-from harness.tools import ToolBox
-
-_MUTATING_ROLES = frozenset({"coder", "test", "doc"})
+from harness.tools import ToolBox, ToolExecutionResult
 
 
 @dataclass
@@ -50,12 +50,13 @@ class RunResult:
     steps: int
     tool_calls: list[str]
     duration_s: float
+    mutated: bool = False
 
 
 def _append_run_log(log_path: Path, prompt: str, result: RunResult) -> None:
     """Enregistre une ligne JSONL pour l'observabilité sans bloquer en cas d'erreur disque."""
     entry = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "role": result.role,
         "model": result.model,
         "prompt": prompt,
@@ -101,13 +102,19 @@ def run_agent(
         )
     )
 
-    def _delegate(target_role: str, task: str) -> str:
+    def _delegate(target_role: str, task: str) -> ToolExecutionResult:
         if target_role == "orchestrator":
-            return "Erreur : l'orchestrateur ne peut pas se déléguer à lui-même."
+            return ToolExecutionResult(
+                "Erreur : l'orchestrateur ne peut pas se déléguer à lui-même."
+            )
         if budget.remaining_delegations <= 0:
-            return "Erreur : nombre maximal de délégations atteint pour cette exécution."
+            return ToolExecutionResult(
+                "Erreur : nombre maximal de délégations atteint pour cette exécution."
+            )
         if budget.remaining_steps <= 0:
-            return "Erreur : budget global d'étapes épuisé, délégation impossible."
+            return ToolExecutionResult(
+                "Erreur : budget global d'étapes épuisé, délégation impossible."
+            )
         budget.remaining_delegations -= 1
         sub_provider = overrides.get(target_role, provider)
         if verbose:
@@ -126,9 +133,12 @@ def run_agent(
             role_providers=overrides,
             _budget=budget,
         )
-        return (
-            f"[{target_role} ({sub_provider.model}) | {sub_result.status} | {sub_result.steps} étapes]\n"
-            f"{sub_result.output}"
+        return ToolExecutionResult(
+            output=(
+                f"[{target_role} ({sub_provider.model}) | {sub_result.status} | {sub_result.steps} étapes]\n"
+                f"{sub_result.output}"
+            ),
+            mutated=sub_result.mutated,
         )
 
     toolbox = ToolBox(
@@ -156,6 +166,7 @@ def run_agent(
                     steps=executed_steps,
                     tool_calls=called_tools,
                     duration_s=time.monotonic() - started,
+                    mutated=mutation_epoch > 0,
                 )
                 _append_run_log(resolved_log, prompt, result)
                 return result
@@ -172,6 +183,7 @@ def run_agent(
                     steps=step,
                     tool_calls=called_tools,
                     duration_s=time.monotonic() - started,
+                    mutated=mutation_epoch > 0,
                 )
                 _append_run_log(resolved_log, prompt, result)
                 return result
@@ -183,15 +195,10 @@ def run_agent(
                         f"[{role.name} étape {step}] {call.name}({call.arguments})",
                         file=sys.stderr,
                     )
-                tool_output = toolbox.execute(call.name, call.arguments)
+                exec_result = toolbox.execute_with_status(call.name, call.arguments)
+                tool_output = exec_result.output
 
-                if call.name in {"edit_file", "write_file"} and "succès" in tool_output:
-                    mutation_epoch += 1
-                elif (
-                    call.name == "delegate_to_agent"
-                    and call.arguments.get("agent_name") in _MUTATING_ROLES
-                    and not tool_output.startswith("Erreur")
-                ):
+                if exec_result.mutated:
                     mutation_epoch += 1
 
                 # Garde-fou anti-boucle : bloque après 3 occurrences identiques (même alternées).
@@ -211,27 +218,40 @@ def run_agent(
                         steps=step,
                         tool_calls=called_tools,
                         duration_s=time.monotonic() - started,
+                        mutated=mutation_epoch > 0,
                     )
                     _append_run_log(resolved_log, prompt, result)
                     return result
 
                 session.add_tool_result(call, tool_output)
-    except (ProviderError, urllib.error.URLError, TimeoutError) as exc:
+    except (ProviderError, urllib.error.URLError, TimeoutError, http.client.HTTPException) as exc:
+        raw_secret = getattr(provider, "_api_key", None)
+        secret = raw_secret if isinstance(raw_secret, str) and raw_secret else None
+        if isinstance(exc, urllib.error.HTTPError):
+            body = extract_http_error_detail(exc)
+            detail = f"HTTP {exc.code} ({body})" if body else f"HTTP {exc.code}"
+        else:
+            detail = str(exc)
+        detail = sanitize_error_message(detail, secret)
         error_result = RunResult(
             role=role.name,
             model=provider.model,
-            output=str(exc),
+            output=detail,
             status="error",
             steps=executed_steps,
             tool_calls=called_tools,
             duration_s=time.monotonic() - started,
+            mutated=mutation_epoch > 0,
         )
         _append_run_log(resolved_log, prompt, error_result)
+        cause = None if (secret and secret in str(exc)) else exc
         if isinstance(exc, ProviderError):
+            if detail != str(exc):
+                raise ProviderError(detail) from cause
             raise
         raise ProviderError(
-            f"Erreur fournisseur ({provider.model}) pour '{role.name}' : {exc}"
-        ) from exc
+            f"Erreur fournisseur ({provider.model}) pour '{role.name}' : {detail}"
+        ) from cause
 
     result = RunResult(
         role=role.name,
@@ -241,6 +261,7 @@ def run_agent(
         steps=executed_steps,
         tool_calls=called_tools,
         duration_s=time.monotonic() - started,
+        mutated=mutation_epoch > 0,
     )
     _append_run_log(resolved_log, prompt, result)
     return result

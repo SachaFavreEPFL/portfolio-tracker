@@ -135,3 +135,30 @@ def test_non_string_tool_arguments_are_rejected(tmp_path: Path) -> None:
     assert "invalide" in box.execute("read_file", {"path": 123})
     assert "invalide" in box.execute("list_files", {"directory": ["src"]})
     assert "invalide" in box.execute("git_diff", {"path": 42})
+
+
+def test_execute_with_status_tracks_mutations_without_string_heuristics(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    box = ToolBox(tmp_path, {"edit_file", "write_file", "read_file"})
+
+    # Même si le nom du fichier contient "succès", un échec d'édition ne doit pas marquer mutated=True.
+    missing = box.execute_with_status(
+        "edit_file", {"path": "src/succès.py", "target": "x", "replacement": "y"}
+    )
+    assert not missing.mutated
+
+    written = box.execute_with_status("write_file", {"path": "src/succès.py", "content": "a = 1\n"})
+    assert written.mutated
+
+    read_res = box.execute_with_status("read_file", {"path": "src/succès.py"})
+    assert not read_res.mutated
+
+    failed_edit = box.execute_with_status(
+        "edit_file", {"path": "src/succès.py", "target": "absent", "replacement": "b = 2"}
+    )
+    assert not failed_edit.mutated
+
+    ok_edit = box.execute_with_status(
+        "edit_file", {"path": "src/succès.py", "target": "a = 1", "replacement": "a = 2"}
+    )
+    assert ok_edit.mutated

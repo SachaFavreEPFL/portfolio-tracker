@@ -1,11 +1,14 @@
 """Outils sécurisés exposés aux agents du harness avec garde-fous par rôle."""
 
+import http.client
 import os
-from pathlib import Path
 import subprocess
 import sys
-from typing import Any, Callable
 import urllib.error
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 from harness.providers import ProviderError
 
@@ -36,7 +39,7 @@ SENSITIVE_SUFFIXES = (
     ".pfx",
     ".jks",
 )
-MAX_OUTPUT_CHARS = 12_000
+MAX_OUTPUT_CHARS = 24_000
 
 
 def _is_ignored_dir(name: str) -> bool:
@@ -228,6 +231,14 @@ def _require_str(arguments: dict[str, Any], key: str) -> str:
     return value
 
 
+@dataclass(frozen=True)
+class ToolExecutionResult:
+    """Résultat structuré d'un appel d'outil, indiquant si le workspace a été modifié."""
+
+    output: str
+    mutated: bool = False
+
+
 class ToolBox:
     """Boîte à outils bornée pour un agent donné (permissions et préfixes d'écriture)."""
 
@@ -237,7 +248,7 @@ class ToolBox:
         allowed_tools: set[str],
         *,
         allowed_write_prefixes: tuple[str, ...] | None = None,
-        delegate_fn: Callable[[str, str], str] | None = None,
+        delegate_fn: Callable[[str, str], str | ToolExecutionResult] | None = None,
     ) -> None:
         self._root = root.resolve()
         self._allowed_tools = set(allowed_tools)
@@ -254,23 +265,29 @@ class ToolBox:
 
     def execute(self, name: str, arguments: dict[str, Any]) -> str:
         """Exécute un outil autorisé et renvoie sa sortie texte sans lever d'exception."""
+        return self.execute_with_status(name, arguments).output
+
+    def execute_with_status(self, name: str, arguments: dict[str, Any]) -> ToolExecutionResult:
+        """Exécute un outil autorisé et renvoie sa sortie ainsi qu'un indicateur de mutation."""
         if name not in self._allowed_tools:
-            return f"Erreur : outil non autorisé pour cet agent : {name}"
+            return ToolExecutionResult(f"Erreur : outil non autorisé pour cet agent : {name}")
         try:
             if name == "list_files":
                 directory = arguments.get("directory")
                 if directory is None or directory == "":
-                    return self._list_files(".")
+                    return ToolExecutionResult(self._list_files("."))
                 if not isinstance(directory, str):
                     raise ValueError(
                         "Paramètre 'directory' invalide (chaîne de caractères attendue)."
                     )
-                return self._list_files(directory)
+                return ToolExecutionResult(self._list_files(directory))
             if name == "read_file":
-                return self._read_file(
-                    _require_str(arguments, "path"),
-                    start_line=arguments.get("start_line"),
-                    end_line=arguments.get("end_line"),
+                return ToolExecutionResult(
+                    self._read_file(
+                        _require_str(arguments, "path"),
+                        start_line=arguments.get("start_line"),
+                        end_line=arguments.get("end_line"),
+                    )
                 )
             if name == "edit_file":
                 return self._edit_file(
@@ -284,9 +301,9 @@ class ToolBox:
                     _require_str(arguments, "content"),
                 )
             if name == "run_checks":
-                return self._run_checks()
+                return ToolExecutionResult(self._run_checks())
             if name == "git_status":
-                return self._run_git(["status", "--short"])
+                return ToolExecutionResult(self._run_git(["status", "--short"]))
             if name == "git_diff":
                 rel_path = arguments.get("path")
                 if rel_path is not None and rel_path != "":
@@ -295,20 +312,25 @@ class ToolBox:
                             "Paramètre 'path' invalide (chaîne de caractères attendue)."
                         )
                     resolved = resolve_safe_path(self._root, rel_path)
-                    return self._run_git(["diff", "--", str(resolved.relative_to(self._root))])
-                return self._run_git(["diff"])
+                    return ToolExecutionResult(
+                        self._run_git(["diff", "--", str(resolved.relative_to(self._root))])
+                    )
+                return ToolExecutionResult(self._run_git(["diff"]))
             if name == "delegate_to_agent":
                 if self._delegate_fn is None:
-                    return "Erreur : délégation non configurée."
-                return self._delegate_fn(
+                    return ToolExecutionResult("Erreur : délégation non configurée.")
+                delegated = self._delegate_fn(
                     _require_str(arguments, "agent_name"),
                     _require_str(arguments, "task"),
                 )
-            return f"Outil inconnu : {name}"
-        except (ProviderError, urllib.error.URLError, TimeoutError):
+                if isinstance(delegated, ToolExecutionResult):
+                    return delegated
+                return ToolExecutionResult(delegated)
+            return ToolExecutionResult(f"Outil inconnu : {name}")
+        except (ProviderError, urllib.error.URLError, TimeoutError, http.client.HTTPException):
             raise
         except Exception as exc:
-            return f"Erreur lors de l'exécution de {name} : {exc}"
+            return ToolExecutionResult(f"Erreur lors de l'exécution de {name} : {exc}")
 
     def _check_write_allowed(self, target: Path) -> None:
         if self._allowed_write_prefixes is None:
@@ -352,34 +374,34 @@ class ToolBox:
         numbered = [f"{idx}: {lines[idx - 1]}" for idx in range(start, end + 1)]
         return _truncate("\n".join(numbered)) if numbered else "(fichier vide)"
 
-    def _edit_file(self, path: str, target_text: str, replacement: str) -> str:
+    def _edit_file(self, path: str, target_text: str, replacement: str) -> ToolExecutionResult:
         target = resolve_safe_path(self._root, path)
         self._check_write_allowed(target)
         if not target.is_file():
-            return f"Fichier introuvable : {path}"
+            return ToolExecutionResult(f"Fichier introuvable : {path}")
         if not target_text:
-            return "Erreur : 'target' ne peut pas être vide."
+            return ToolExecutionResult("Erreur : 'target' ne peut pas être vide.")
 
         content = target.read_text(encoding="utf-8")
         occurrences = content.count(target_text)
         if occurrences == 0:
-            return f"Erreur : texte cible introuvable dans {path}."
+            return ToolExecutionResult(f"Erreur : texte cible introuvable dans {path}.")
         if occurrences > 1:
-            return (
+            return ToolExecutionResult(
                 f"Erreur : texte cible ambigu ({occurrences} occurrences dans {path}). "
                 "Fournissez davantage de contexte."
             )
 
         updated = content.replace(target_text, replacement, 1)
         target.write_text(updated, encoding="utf-8")
-        return f"Fichier modifié avec succès : {path}"
+        return ToolExecutionResult(f"Fichier modifié avec succès : {path}", mutated=True)
 
-    def _write_file(self, path: str, content: str) -> str:
+    def _write_file(self, path: str, content: str) -> ToolExecutionResult:
         target = resolve_safe_path(self._root, path)
         self._check_write_allowed(target)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
-        return f"Fichier écrit avec succès : {path}"
+        return ToolExecutionResult(f"Fichier écrit avec succès : {path}", mutated=True)
 
     def _run_checks(self) -> str:
         check_script = self._root / "harness" / "check.py"

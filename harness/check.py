@@ -3,16 +3,18 @@
 
 import importlib.util
 import os
-from pathlib import Path
 import subprocess
 import sys
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
 
-# Relance dans le .venv du projet si exécuté avec le Python système.
-if VENV_PYTHON.exists() and Path(sys.prefix).resolve() != (ROOT / ".venv").resolve():
-    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
+
+def _reexec_in_venv_if_needed() -> None:
+    """Relance dans le .venv du projet si exécuté avec un autre interpréteur."""
+    if VENV_PYTHON.exists() and Path(sys.prefix).resolve() != (ROOT / ".venv").resolve():
+        os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
 
 
 def _run_step(label: str, cmd: list[str], module_name: str) -> bool:
@@ -54,4 +56,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    _reexec_in_venv_if_needed()
     raise SystemExit(main())

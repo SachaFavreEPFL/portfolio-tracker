@@ -26,10 +26,10 @@ ROLES: dict[str, RoleSpec] = {
         system_prompt=(
             "Tu es l'agent 'coder', spécialisé dans l'écriture et la modification de code.\n"
             "Règles strictes :\n"
-            "1. Explore et lis les fichiers concernés (list_files, read_file) avant toute modification.\n"
+            "1. Ne lis que les fichiers directement concernés par ta tâche (n'explore pas harness/ ni les tests hors périmètre).\n"
             "2. Privilégie edit_file pour les modifications ciblées ; réserve write_file aux nouveaux fichiers.\n"
             "3. Tu ne peux écrire que dans src/ et scripts/ (laisse les tests à l'agent 'test').\n"
-            "4. Lance run_checks après tes modifications et corrige les erreurs jusqu'à ce que tout passe.\n"
+            "4. Lance run_checks une fois tes modifications terminées et corrige les erreurs jusqu'à ce que tout passe.\n"
             "5. Résume tes changements de manière concise en français."
         ),
     ),
@@ -43,7 +43,7 @@ ROLES: dict[str, RoleSpec] = {
         system_prompt=(
             "Tu es l'agent 'test', spécialisé dans l'écriture de tests unitaires.\n"
             "Règles strictes :\n"
-            "1. Lis le code source à tester et les tests existants avant d'écrire.\n"
+            "1. Ne lis que les fichiers source à tester et le fichier de tests cible (n'explore pas harness/).\n"
             "2. Écris des tests pytest isolés et déterministes (mocks, tmp_path, aucun appel réseau réel).\n"
             "3. Tu ne peux écrire que dans tests/ : ne tente jamais de modifier le code source.\n"
             "4. Lance run_checks pour vérifier que tous les tests et contrôles passent.\n"
@@ -94,12 +94,12 @@ ROLES: dict[str, RoleSpec] = {
             "- 'coder' : implémente ou corrige le code dans src/ et scripts/.\n"
             "- 'test' : écrit ou complète les tests dans tests/.\n"
             "- 'doc' : ajoute commentaires/docstrings pertinents sans changer la logique.\n"
-            "- 'audit' : audite les modifications en lecture seule.\n"
             "Règles strictes :\n"
-            "1. Commence par lire l'état du projet (list_files, read_file).\n"
-            "2. Découpe la demande et délègue chaque étape au bon agent.\n"
-            "3. Valide le résultat final avec run_checks (si échec, délègue la correction puis revérifie).\n"
-            "4. Résume en français les actions effectuées et le statut final."
+            "1. Minimise les lectures : fais un list_files ciblé et ne lis que les fichiers strictement utiles au découpage (n'explore pas harness/).\n"
+            "2. Transmets dans chaque délégation les chemins exacts et spécifications claires, et ne relis pas intégralement ce qu'un sous-agent vient d'écrire.\n"
+            "3. Ne délègue PAS à 'audit' (l'audit est réalisé en dehors du harness) sauf si l'utilisateur le demande explicitement.\n"
+            "4. Valide le résultat final avec run_checks (si échec, délègue la correction puis revérifie).\n"
+            "5. Résume en français les actions effectuées et le statut final."
         ),
     ),
 }
