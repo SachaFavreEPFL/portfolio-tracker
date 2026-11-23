@@ -22,7 +22,10 @@ CACHE_PATH_ENV_VAR = "PORTFOLIO_TRACKER_CACHE_PATH"
 DEFAULT_CACHE_TTL = timedelta(hours=24)
 DEFAULT_MAX_RETRIES = 2
 DEFAULT_RETRY_BACKOFF_SECONDS = 1.0
-DEFAULT_TIMEOUT_SECONDS = 30.0
+# Légèrement supérieur au timeout interne de yfinance (30s) pour laisser les sockets se fermer proprement.
+DEFAULT_TIMEOUT_SECONDS = 35.0
+DEFAULT_MAX_STALLED_WORKERS = 6
+MAX_TIMEOUT_RETRIES_PER_SYMBOL = 1
 
 
 def _resolve_default_cache_path() -> Path:
@@ -66,14 +69,25 @@ class YFinanceMarketDataProvider:
         max_retries: int = DEFAULT_MAX_RETRIES,
         backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
+        max_stalled_workers: int = DEFAULT_MAX_STALLED_WORKERS,
         sleep: Callable[[float], None] = time.sleep,
     ) -> None:
+        if not isinstance(cache_ttl, timedelta) or cache_ttl < timedelta(0):
+            raise MarketDataError("cache_ttl doit être une durée supérieure ou égale à 0.")
         if isinstance(max_retries, bool) or max_retries < 0:
             raise MarketDataError("max_retries doit être un entier supérieur ou égal à 0.")
-        if isinstance(backoff_seconds, bool) or backoff_seconds < 0:
-            raise MarketDataError("backoff_seconds doit être un nombre supérieur ou égal à 0.")
+        if (
+            isinstance(backoff_seconds, bool)
+            or not math.isfinite(backoff_seconds)
+            or backoff_seconds < 0
+        ):
+            raise MarketDataError(
+                "backoff_seconds doit être un nombre fini supérieur ou égal à 0."
+            )
         if isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0:
             raise MarketDataError("timeout doit être un nombre fini strictement positif.")
+        if isinstance(max_stalled_workers, bool) or max_stalled_workers < 1:
+            raise MarketDataError("max_stalled_workers doit être un entier supérieur ou égal à 1.")
         self._cache_path = cache_path if cache_path is not None else _resolve_default_cache_path()
         self._ticker_factory = ticker_factory
         self._cache_ttl = cache_ttl
@@ -81,7 +95,13 @@ class YFinanceMarketDataProvider:
         self._max_retries = max_retries
         self._backoff_seconds = backoff_seconds
         self._timeout = float(timeout)
+        self._max_stalled_workers = max_stalled_workers
+        self._stalled_threads: list[threading.Thread] = []
+        self._stalled_lock = threading.Lock()
+        self._cache_lock = threading.Lock()
         self._sleep = sleep
+        if ticker_factory is yf.Ticker:
+            _ensure_yfinance_exceptions_visible()
 
     def get(self, symbol: str, *, force_refresh: bool = False) -> StockData:
         normalized = symbol.strip().upper()
@@ -93,20 +113,24 @@ class YFinanceMarketDataProvider:
         if now.tzinfo is None:
             now = now.replace(tzinfo=UTC)
         if not force_refresh:
-            cache = self._load_cache()
+            with self._cache_lock:
+                cache = self._load_cache()
             if normalized in cache:
                 cached_stock = self._read_fresh_entry(cache[normalized], now)
                 if cached_stock is not None:
+                    logger.debug("Cache hit pour %s.", normalized)
                     return cached_stock
 
+        logger.info("Récupération yfinance pour %s (force_refresh=%s).", normalized, force_refresh)
         stock = self._fetch_from_yfinance(normalized)
-        # Recharge juste avant l'écriture pour limiter l'écrasement d'entrées écrites en parallèle.
-        latest_cache = self._load_cache()
-        latest_cache[normalized] = {
-            "fetched_at": now.isoformat(),
-            "data": stock.model_dump(mode="json"),
-        }
-        self._save_cache(latest_cache)
+        with self._cache_lock:
+            latest_cache, can_save = self._read_cache()
+            if can_save:
+                latest_cache[normalized] = {
+                    "fetched_at": now.isoformat(),
+                    "data": stock.model_dump(mode="json"),
+                }
+                self._save_cache(latest_cache)
         return stock
 
     def _read_fresh_entry(self, entry: Any, now: datetime) -> StockData | None:
@@ -131,16 +155,39 @@ class YFinanceMarketDataProvider:
         except ValidationError:
             return None
 
+    def _active_stalled_count(self) -> int:
+        with self._stalled_lock:
+            self._stalled_threads = [t for t in self._stalled_threads if t.is_alive()]
+            return len(self._stalled_threads)
+
+    def _record_stalled_thread(self, thread: threading.Thread) -> None:
+        with self._stalled_lock:
+            self._stalled_threads = [t for t in self._stalled_threads if t.is_alive()]
+            self._stalled_threads.append(thread)
+
+    def _run_with_timeout(self, fn: Callable[[], Any]) -> Any:
+        stalled_count = self._active_stalled_count()
+        if stalled_count >= self._max_stalled_workers:
+            raise MarketDataError(
+                f"Trop d'appels yfinance déjà bloqués en arrière-plan "
+                f"({stalled_count}/{self._max_stalled_workers})."
+            )
+        return _call_with_timeout(
+            fn,
+            self._timeout,
+            on_timeout=self._record_stalled_thread,
+        )
+
     def _fetch_from_yfinance(self, symbol: str) -> StockData:
+        _ensure_yfinance_exceptions_visible()
         raw_info: Any = None
+        timeout_retries_used = 0
+        max_timeout_retries = min(self._max_retries, MAX_TIMEOUT_RETRIES_PER_SYMBOL)
         for attempt in range(self._max_retries + 1):
             try:
-                raw_info = _call_with_timeout(
-                    lambda: self._ticker_factory(symbol).info,
-                    self._timeout,
-                )
+                raw_info = self._run_with_timeout(lambda: self._ticker_factory(symbol).info)
                 break
-            except StockNotFoundError:
+            except MarketDataError:
                 raise
             except (TypeError, AttributeError, KeyError) as exc:
                 # Les erreurs de programmation ou de structure interne ne sont pas transitoires.
@@ -148,7 +195,14 @@ class YFinanceMarketDataProvider:
                     f"Erreur lors de la récupération de {symbol} : {exc}"
                 ) from exc
             except TimeoutError as exc:
-                if attempt < self._max_retries:
+                # Plafonne les retries après timeout pour éviter qu'un seul ticker lent ne sature tous les workers.
+                can_retry_timeout = (
+                    attempt < self._max_retries
+                    and timeout_retries_used < max_timeout_retries
+                    and self._active_stalled_count() < self._max_stalled_workers
+                )
+                if can_retry_timeout:
+                    timeout_retries_used += 1
                     delay = self._backoff_seconds * (2**attempt)
                     logger.warning(
                         "Timeout yfinance (%ss) pour %s (tentative %d/%d), nouvelle tentative dans %.1fs.",
@@ -199,8 +253,8 @@ class YFinanceMarketDataProvider:
             info = raw_info
 
         price = _extract_price(info)
-        name = info.get("shortName") or info.get("longName")
-        # yfinance renvoie souvent un dict quasi vide pour un ticker inconnu au lieu de lever une erreur.
+        name = _extract_name(info)
+        # yfinance renvoie souvent un dict quasi vide (ou un nom blanc) pour un ticker inconnu au lieu de lever une erreur.
         if price is None and not name:
             raise StockNotFoundError(f"Aucune donnée trouvée pour le symbole {symbol}.")
 
@@ -225,21 +279,38 @@ class YFinanceMarketDataProvider:
                 f"Données invalides reçues pour {symbol} : {exc}"
             ) from exc
 
-    def _load_cache(self) -> dict[str, Any]:
+    def _read_cache(self) -> tuple[dict[str, Any], bool]:
         if not self._cache_path.exists():
-            return {}
+            return {}, True
         try:
-            data = json.loads(self._cache_path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raw_text = self._cache_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            # Ne pas écraser un cache existant simplement illisible temporairement.
             logger.warning("Impossible de charger le cache %s : %s", self._cache_path, exc)
-            return {}
+            return {}, False
+        except UnicodeDecodeError as exc:
+            logger.warning("Impossible de charger le cache %s : %s", self._cache_path, exc)
+            return {}, True
+        try:
+            data = json.loads(raw_text, parse_constant=_reject_non_finite_json_constant)
+        except (json.JSONDecodeError, ValueError) as exc:
+            logger.warning("Impossible de charger le cache %s : %s", self._cache_path, exc)
+            return {}, True
         if not isinstance(data, dict):
             logger.warning("Format de cache invalide dans %s (objet JSON attendu).", self._cache_path)
-            return {}
-        return data
+            return {}, True
+        return data, True
+
+    def _load_cache(self) -> dict[str, Any]:
+        cache, _ = self._read_cache()
+        return cache
 
     def _save_cache(self, cache: dict[str, Any]) -> None:
-        payload = json.dumps(cache, indent=2, ensure_ascii=False)
+        try:
+            payload = json.dumps(cache, indent=2, ensure_ascii=False, allow_nan=False)
+        except ValueError as exc:
+            logger.warning("Impossible d'enregistrer le cache %s : %s", self._cache_path, exc)
+            return
         tmp_path: str | None = None
         try:
             self._cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -262,6 +333,26 @@ class YFinanceMarketDataProvider:
                     pass
 
 
+def _reject_non_finite_json_constant(value: str) -> Any:
+    """Rejette NaN/Infinity dans le cache JSON afin de déclencher une auto-réparation."""
+    raise ValueError(f"Constante JSON non finie refusée : {value}")
+
+
+def _extract_name(info: dict[str, Any]) -> Any:
+    """Retourne le nom court ou long en ignorant les chaînes vides/blanches."""
+    for key in ("shortName", "longName"):
+        raw = info.get(key)
+        if raw is None:
+            continue
+        if isinstance(raw, str):
+            cleaned = raw.strip()
+            if cleaned:
+                return cleaned
+            continue
+        return raw
+    return None
+
+
 def _extract_price(info: dict[str, Any]) -> float | None:
     # Ordre de repli : cours temps réel/régulier, valeur liquidative (ETF), puis clôture veille.
     for key in ("currentPrice", "regularMarketPrice", "navPrice", "previousClose"):
@@ -282,7 +373,12 @@ def _to_float(value: Any) -> float | None:
     return result if math.isfinite(result) else None
 
 
-def _call_with_timeout(fn: Callable[[], Any], timeout: float) -> Any:
+def _call_with_timeout(
+    fn: Callable[[], Any],
+    timeout: float,
+    *,
+    on_timeout: Callable[[threading.Thread], None] | None = None,
+) -> Any:
     """Exécute un appel bloquant yfinance dans un thread daemon sans bloquer la sortie sur timeout."""
     done = threading.Event()
     outcome: list[Any] = []
@@ -300,21 +396,34 @@ def _call_with_timeout(fn: Callable[[], Any], timeout: float) -> Any:
     thread = threading.Thread(target=_worker, name="yfinance-fetch", daemon=True)
     thread.start()
     if not done.wait(timeout=timeout):
+        if on_timeout is not None:
+            on_timeout(thread)
         raise TimeoutError(f"Délai d'attente dépassé ({timeout}s).")
     if error:
         raise error[0]
     return outcome[0]
 
 
+def _ensure_yfinance_exceptions_visible() -> None:
+    """Désactive hide_exceptions dans yfinance (>=1.x) afin que les erreurs HTTP remontent."""
+    config = getattr(yf, "config", None)
+    debug_cfg = getattr(config, "debug", None)
+    if debug_cfg is not None and getattr(debug_cfg, "hide_exceptions", False):
+        debug_cfg.hide_exceptions = False
+
+
 def _extract_http_status_code(exc: BaseException) -> int | None:
-    """Extrait un code HTTP depuis urllib, requests ou curl_cffi sans coupler au backend."""
+    """Extrait un code HTTP depuis urllib, requests, curl_cffi ou yfinance sans coupler au backend."""
     if isinstance(exc, urllib.error.HTTPError):
         return exc.code
+    rate_limit_cls = getattr(getattr(yf, "exceptions", None), "YFRateLimitError", None)
+    if isinstance(rate_limit_cls, type) and isinstance(exc, rate_limit_cls):
+        return 429
     response = getattr(exc, "response", None)
     status_code = getattr(response, "status_code", None)
     if isinstance(status_code, int) and not isinstance(status_code, bool):
         return status_code
     code = getattr(exc, "code", None)
-    if isinstance(code, int) and not isinstance(code, bool):
+    if isinstance(code, int) and not isinstance(code, bool) and 100 <= code <= 599:
         return code
     return None

@@ -579,13 +579,32 @@ def test_provider_rejects_invalid_max_retries(tmp_path: Path, invalid_retries: i
         YFinanceMarketDataProvider(cache_path=tmp_path / "stocks.json", max_retries=invalid_retries)
 
 
-@pytest.mark.parametrize("invalid_backoff", [-0.1, True, False])
+@pytest.mark.parametrize(
+    "invalid_backoff", [-0.1, float("nan"), float("inf"), float("-inf"), True, False]
+)
 def test_provider_rejects_invalid_backoff_seconds(
     tmp_path: Path, invalid_backoff: float
 ) -> None:
     with pytest.raises(MarketDataError):
         YFinanceMarketDataProvider(
             cache_path=tmp_path / "stocks.json", backoff_seconds=invalid_backoff
+        )
+
+
+@pytest.mark.parametrize("invalid_ttl", [timedelta(seconds=-1), timedelta(hours=-2)])
+def test_provider_rejects_negative_cache_ttl(tmp_path: Path, invalid_ttl: timedelta) -> None:
+    with pytest.raises(MarketDataError, match="cache_ttl"):
+        YFinanceMarketDataProvider(cache_path=tmp_path / "stocks.json", cache_ttl=invalid_ttl)
+
+
+@pytest.mark.parametrize("invalid_workers", [0, -1, True, False])
+def test_provider_rejects_invalid_max_stalled_workers(
+    tmp_path: Path, invalid_workers: int
+) -> None:
+    with pytest.raises(MarketDataError, match="max_stalled_workers"):
+        YFinanceMarketDataProvider(
+            cache_path=tmp_path / "stocks.json",
+            max_stalled_workers=invalid_workers,
         )
 
 
@@ -731,3 +750,333 @@ def test_get_does_not_retry_non_429_http_4xx_and_retries_429(tmp_path: Path) -> 
     assert provider_429.get("NVDA").price == 150.0
     assert factory_429.call_count == 2
     assert delays_429 == [0.25]
+
+
+def test_provider_caps_stalled_daemon_threads_and_recovers_after_exit(tmp_path: Path) -> None:
+    import threading
+
+    release = threading.Event()
+    calls = 0
+
+    def hanging_factory(symbol: str) -> MagicMock:
+        nonlocal calls
+        calls += 1
+        release.wait(timeout=2.0)
+        return _make_mock_ticker({"shortName": symbol, "currentPrice": 50.0})
+
+    provider = YFinanceMarketDataProvider(
+        cache_path=tmp_path / "stocks.json",
+        ticker_factory=hanging_factory,
+        max_retries=0,
+        timeout=0.05,
+        max_stalled_workers=2,
+    )
+
+    try:
+        with pytest.raises(MarketDataError, match="Délai d'attente dépassé"):
+            provider.get("AAA")
+        with pytest.raises(MarketDataError, match="Délai d'attente dépassé"):
+            provider.get("BBB")
+        # 2 threads bloqués = plafond atteint : refuse immédiatement sans lancer un 3e thread zombie.
+        with pytest.raises(MarketDataError, match="bloqués en arrière-plan"):
+            provider.get("CCC")
+        assert calls == 2
+    finally:
+        release.set()
+
+    # Une fois les threads bloqués terminés, le fournisseur redevient opérationnel.
+    for thread in list(provider._stalled_threads):
+        thread.join(timeout=1.0)
+    stock = provider.get("DDD")
+    assert stock.symbol == "DDD"
+    assert calls == 3
+
+
+def test_cache_os_error_on_read_does_not_overwrite_existing_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cache_file = tmp_path / "stocks.json"
+    original_content = json.dumps(
+        {
+            "AAPL": {
+                "fetched_at": datetime(2026, 11, 17, 10, 0, tzinfo=UTC).isoformat(),
+                "data": {"symbol": "AAPL", "name": "Apple Inc.", "price": 225.0},
+            }
+        }
+    )
+    cache_file.write_text(original_content, encoding="utf-8")
+
+    real_read_text = Path.read_text
+
+    def failing_read_text(self: Path, *args: object, **kwargs: object) -> str:
+        if self == cache_file:
+            raise OSError("lecture temporairement impossible")
+        return real_read_text(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "read_text", failing_read_text)
+
+    provider = YFinanceMarketDataProvider(
+        cache_path=cache_file,
+        ticker_factory=MagicMock(
+            return_value=_make_mock_ticker({"shortName": "NVIDIA", "currentPrice": 150.0})
+        ),
+    )
+
+    stock = provider.get("NVDA")
+    assert stock.price == 150.0
+
+    # Le cache existant ne doit pas avoir été écrasé par un dictionnaire ne contenant que NVDA.
+    monkeypatch.undo()
+    assert json.loads(cache_file.read_text(encoding="utf-8")) == json.loads(original_content)
+
+
+def test_get_rejects_whitespace_only_name_without_price_and_falls_back_to_long_name(
+    tmp_path: Path,
+) -> None:
+    cache_file = tmp_path / "stocks.json"
+    blank_provider = YFinanceMarketDataProvider(
+        cache_path=cache_file,
+        ticker_factory=MagicMock(
+            return_value=_make_mock_ticker({"shortName": "   ", "longName": "\t\n"})
+        ),
+    )
+    with pytest.raises(StockNotFoundError):
+        blank_provider.get("GHOST")
+    assert not cache_file.exists()
+
+    fallback_provider = YFinanceMarketDataProvider(
+        cache_path=cache_file,
+        ticker_factory=MagicMock(
+            return_value=_make_mock_ticker({"shortName": "   ", "longName": "  Apple Inc.  "})
+        ),
+    )
+    stock = fallback_provider.get("AAPL")
+    assert stock.name == "Apple Inc."
+
+
+def test_stock_data_rejects_invalid_fields_and_cache_heals_non_finite_json(tmp_path: Path) -> None:
+    from pydantic import ValidationError
+
+    from portfolio_tracker.contracts import StockData
+
+    for bad_kwargs in (
+        {"symbol": "", "name": "Apple"},
+        {"symbol": "   ", "name": "Apple"},
+        {"symbol": "AAPL", "name": "   "},
+        {"symbol": "AAPL", "name": "Apple", "price": float("nan")},
+        {"symbol": "AAPL", "name": "Apple", "price": float("inf")},
+    ):
+        with pytest.raises(ValidationError):
+            StockData(**bad_kwargs)  # type: ignore[arg-type]
+
+    cache_file = tmp_path / "nan_cache.json"
+    now = datetime(2026, 11, 17, 12, 0, tzinfo=UTC)
+    cache_file.write_text(
+        '{"NVDA": {"fetched_at": "'
+        + now.isoformat()
+        + '", "data": {"symbol": "NVDA", "name": "NVIDIA", "price": NaN}}}',
+        encoding="utf-8",
+    )
+    provider = YFinanceMarketDataProvider(
+        cache_path=cache_file,
+        ticker_factory=MagicMock(
+            return_value=_make_mock_ticker({"shortName": "NVIDIA", "currentPrice": 150.0})
+        ),
+        clock=lambda: now,
+    )
+
+    stock = provider.get("NVDA")
+    assert stock.price == 150.0
+    reloaded = json.loads(cache_file.read_text(encoding="utf-8"))
+    assert reloaded["NVDA"]["data"]["price"] == 150.0
+
+
+def test_timeout_retries_are_capped_and_skip_sleep_when_stalled_limit_reached(
+    tmp_path: Path,
+) -> None:
+    import threading
+
+    release = threading.Event()
+    delays_cap: list[float] = []
+
+    def hanging_factory(symbol: str) -> MagicMock:
+        release.wait(timeout=2.0)
+        return _make_mock_ticker({"shortName": symbol, "currentPrice": 1.0})
+
+    factory_cap = MagicMock(side_effect=hanging_factory)
+    provider_cap = YFinanceMarketDataProvider(
+        cache_path=tmp_path / "cap.json",
+        ticker_factory=factory_cap,
+        max_retries=3,
+        backoff_seconds=0.1,
+        timeout=0.05,
+        max_stalled_workers=5,
+        sleep=delays_cap.append,
+    )
+
+    delays_full: list[float] = []
+    factory_full = MagicMock(side_effect=hanging_factory)
+    provider_full = YFinanceMarketDataProvider(
+        cache_path=tmp_path / "full.json",
+        ticker_factory=factory_full,
+        max_retries=2,
+        backoff_seconds=0.5,
+        timeout=0.05,
+        max_stalled_workers=1,
+        sleep=delays_full.append,
+    )
+
+    try:
+        # Même avec max_retries=3, un timeout ne déclenche qu'1 retry (2 appels max par symbole).
+        with pytest.raises(MarketDataError, match="Délai d'attente dépassé"):
+            provider_cap.get("NVDA")
+        assert factory_cap.call_count == 2
+        assert delays_cap == [0.1]
+
+        # Avec max_stalled_workers=1 atteint dès la 1re tentative, aucun sleep inutile avant l'échec.
+        with pytest.raises(MarketDataError, match="Délai d'attente dépassé"):
+            provider_full.get("AAPL")
+        assert factory_full.call_count == 1
+        assert delays_full == []
+    finally:
+        release.set()
+
+
+def test_provider_concurrent_get_calls_preserve_all_cache_entries(tmp_path: Path) -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    cache_file = tmp_path / "concurrent.json"
+    symbols = ["AAPL", "NVDA", "MSFT", "AMZN", "META", "PEP"]
+    provider = YFinanceMarketDataProvider(
+        cache_path=cache_file,
+        ticker_factory=lambda sym: _make_mock_ticker({"shortName": f"{sym} Corp", "currentPrice": 100.0}),
+    )
+
+    with ThreadPoolExecutor(max_workers=len(symbols)) as pool:
+        results = list(pool.map(provider.get, symbols))
+
+    assert {stock.symbol for stock in results} == set(symbols)
+    cached = json.loads(cache_file.read_text(encoding="utf-8"))
+    assert set(cached) == set(symbols)
+
+
+def test_provider_disables_yfinance_hide_exceptions_and_handles_real_http_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import yfinance as yf
+    from curl_cffi.requests.exceptions import HTTPError as CurlHTTPError
+
+    original_hide_exceptions = yf.config.debug.hide_exceptions
+    yf.config.debug.hide_exceptions = True
+
+    def _make_fake_response(status_code: int) -> MagicMock:
+        resp = MagicMock()
+        resp.status_code = status_code
+        resp.text = '{"timeseries":{"result":[]}}'
+        resp.url = "https://query1.finance.yahoo.com/v10/finance/quoteSummary/NVDA"
+
+        def _raise_for_status() -> None:
+            if status_code >= 400:
+                raise CurlHTTPError(f"HTTP Error {status_code}", response=resp)
+
+        resp.raise_for_status.side_effect = _raise_for_status
+        return resp
+
+    class _FakeSession:
+        def __init__(self, status_code: int) -> None:
+            self._resp = _make_fake_response(status_code)
+
+        def get(self, *args: object, **kwargs: object) -> MagicMock:
+            return self._resp
+
+    def _make_real_ticker_factory(status_code: int) -> MagicMock:
+        def _factory(symbol: str) -> yf.Ticker:
+            ticker = yf.Ticker(symbol)
+            monkeypatch.setattr(ticker._data, "_session", _FakeSession(status_code))
+            monkeypatch.setattr(
+                ticker._data,
+                "_get_cookie_and_crumb",
+                MagicMock(return_value=("crumb", "basic")),
+            )
+            monkeypatch.setattr(ticker._data, "_set_cookie_strategy", MagicMock())
+            return ticker
+
+        return MagicMock(side_effect=_factory)
+
+    try:
+        # 503 transitoire via un vrai yf.Ticker : ne doit pas être avalé en StockNotFoundError, et doit être retenté.
+        delays_503: list[float] = []
+        factory_503 = _make_real_ticker_factory(503)
+        provider_503 = YFinanceMarketDataProvider(
+            cache_path=tmp_path / "c503.json",
+            ticker_factory=factory_503,
+            max_retries=2,
+            backoff_seconds=0.1,
+            sleep=delays_503.append,
+        )
+        with pytest.raises(MarketDataError) as exc_503:
+            provider_503.get("NVDA")
+        assert not isinstance(exc_503.value, StockNotFoundError)
+        assert yf.config.debug.hide_exceptions is False
+        assert factory_503.call_count == 3
+        assert delays_503 == [0.1, 0.2]
+
+        # 404 via un vrai yf.Ticker : mappé en StockNotFoundError sans retry.
+        delays_404: list[float] = []
+        factory_404 = _make_real_ticker_factory(404)
+        provider_404 = YFinanceMarketDataProvider(
+            cache_path=tmp_path / "c404.json",
+            ticker_factory=factory_404,
+            max_retries=2,
+            backoff_seconds=0.1,
+            sleep=delays_404.append,
+        )
+        with pytest.raises(StockNotFoundError):
+            provider_404.get("UNKNOWN")
+        assert factory_404.call_count == 1
+        assert delays_404 == []
+
+        # 403 via un vrai yf.Ticker : MarketDataError immédiate sans retry (pas StockNotFoundError).
+        delays_403: list[float] = []
+        factory_403 = _make_real_ticker_factory(403)
+        provider_403 = YFinanceMarketDataProvider(
+            cache_path=tmp_path / "c403.json",
+            ticker_factory=factory_403,
+            max_retries=2,
+            backoff_seconds=0.1,
+            sleep=delays_403.append,
+        )
+        with pytest.raises(MarketDataError, match="HTTP 403") as exc_403:
+            provider_403.get("NVDA")
+        assert not isinstance(exc_403.value, StockNotFoundError)
+        assert factory_403.call_count == 1
+        assert delays_403 == []
+
+        # 429 via un vrai yf.Ticker (YFRateLimitError) : retenté avec backoff.
+        delays_429: list[float] = []
+        factory_429 = _make_real_ticker_factory(429)
+        provider_429 = YFinanceMarketDataProvider(
+            cache_path=tmp_path / "c429.json",
+            ticker_factory=factory_429,
+            max_retries=1,
+            backoff_seconds=0.25,
+            sleep=delays_429.append,
+        )
+        with pytest.raises(MarketDataError) as exc_429:
+            provider_429.get("NVDA")
+        assert not isinstance(exc_429.value, StockNotFoundError)
+        assert factory_429.call_count == 2
+        assert delays_429 == [0.25]
+    finally:
+        yf.config.debug.hide_exceptions = original_hide_exceptions
+
+
+def test_extract_http_status_code_maps_yfinance_rate_limit_and_ignores_curl_codes() -> None:
+    from curl_cffi.curl import CurlError
+    from yfinance.exceptions import YFRateLimitError
+
+    from portfolio_tracker.market_data import _extract_http_status_code
+
+    assert _extract_http_status_code(YFRateLimitError()) == 429
+    assert _extract_http_status_code(CurlError("operation timed out", code=28)) is None
+    assert _extract_http_status_code(CurlError("ok", code=0)) is None

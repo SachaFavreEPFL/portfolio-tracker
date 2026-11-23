@@ -335,8 +335,12 @@ def test_read_env_file_key_handles_formats_and_invalid_utf8(tmp_path: Path) -> N
     assert _read_env_file_key(missing, "GEMINI_API_KEY") == ""
 
     env_file = tmp_path / ".env"
-    env_file.write_text('export GEMINI_API_KEY="my-secret"\n', encoding="utf-8")
+    env_file.write_text('export GEMINI_API_KEY="my-secret" # prod\n', encoding="utf-8")
     assert _read_env_file_key(env_file, "GEMINI_API_KEY") == "my-secret"
+
+    env_plain = tmp_path / "plain.env"
+    env_plain.write_text("GEMINI_API_KEY=plain-secret # commentaire\n", encoding="utf-8")
+    assert _read_env_file_key(env_plain, "GEMINI_API_KEY") == "plain-secret"
 
     bad_utf8 = tmp_path / "bad.env"
     bad_utf8.write_bytes(b"\xff\xfe\x00\x80")
@@ -449,3 +453,31 @@ def test_http_json_redacts_authorization_header_and_suppresses_leaking_cause(
     assert token not in str(exc_info.value)
     assert token not in formatted_tb
     assert exc_info.value.__cause__ is None
+
+
+def test_http_json_does_not_retry_url_error_wrapping_ssl_cert_verification_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ssl
+
+    attempts = 0
+    delays: list[float] = []
+
+    def fake_urlopen(request: urllib.request.Request, timeout: int) -> Any:
+        nonlocal attempts
+        attempts += 1
+        raise urllib.error.URLError(ssl.SSLCertVerificationError("certificate verify failed"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    with pytest.raises(ProviderError, match="Erreur réseau"):
+        http_json(
+            "https://api.example.test/interactions",
+            {"a": 1},
+            max_retries=2,
+            backoff_seconds=0.5,
+            sleep=delays.append,
+        )
+
+    assert attempts == 1
+    assert delays == []

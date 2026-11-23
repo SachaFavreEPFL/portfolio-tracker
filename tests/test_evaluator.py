@@ -1,6 +1,7 @@
 import http.client
 import io
 import json
+import ssl
 import traceback
 import urllib.error
 import urllib.request
@@ -11,13 +12,22 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from portfolio_tracker.contracts import StockData, StockEvaluation, Verdict
+from portfolio_tracker.contracts import (
+    MAX_COMMENT_LENGTH,
+    StockData,
+    StockEvaluation,
+    Verdict,
+    expected_verdict_for_score,
+    format_verdict,
+)
 from portfolio_tracker.evaluator import (
+    _EVALUATION_RESPONSE_SCHEMA,
     DEFAULT_GEMINI_API_BASE_URL,
     DEFAULT_GEMINI_MODEL,
     ENV_PATH_ENV_VAR,
     EvaluationError,
     GeminiStockEvaluator,
+    _build_evaluation_prompt,
     http_post_json,
     resolve_gemini_api_key,
 )
@@ -45,6 +55,7 @@ def _valid_evaluation_payload(**overrides: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "verdict": "ACHAT",
         "score": 8,
+        "comment": "Croissance IA très soutenue et marges élevées, valorisation exigeante.",
         "summary": "Croissance exceptionnelle et marges très élevées.",
         "strengths": ["Forte croissance du chiffre d'affaires", "Marges nettes élevées"],
         "risks": ["Valorisation exigeante", "Cycle semi-conducteurs"],
@@ -133,14 +144,27 @@ def test_evaluate_success_checks_request_and_returns_stock_evaluation() -> None:
     schema = gen_config["responseSchema"]
     assert schema["type"] == "OBJECT"
     assert schema["properties"]["verdict"]["enum"] == ["ACHAT", "CONSERVER", "VENDRE"]
-    assert schema["properties"]["score"]["minimum"] == 1
+    assert schema["properties"]["score"]["minimum"] == 0
     assert schema["properties"]["score"]["maximum"] == 10
-    assert set(schema["required"]) == {"verdict", "score", "summary", "strengths", "risks"}
+    assert schema["properties"]["comment"]["type"] == "STRING"
+    assert set(schema["required"]) == {
+        "verdict",
+        "score",
+        "comment",
+        "summary",
+        "strengths",
+        "risks",
+    }
 
     assert isinstance(result, StockEvaluation)
     assert result.symbol == "NVDA"
     assert result.verdict == "ACHAT"
+    assert result.decision_label == "Achat"
     assert result.score == 8
+    assert (
+        result.comment
+        == "Croissance IA très soutenue et marges élevées, valorisation exigeante."
+    )
     assert result.summary == "Croissance exceptionnelle et marges très élevées."
     assert result.strengths == ["Forte croissance du chiffre d'affaires", "Marges nettes élevées"]
     assert result.risks == ["Valorisation exigeante", "Cycle semi-conducteurs"]
@@ -240,6 +264,22 @@ def test_resolve_api_key_from_environment_over_dotenv(
         (
             "# Ligne sans égal ignorée\nINVALID_LINE\nGEMINI_API_KEY=first\nGEMINI_API_KEY=last\n",
             "last",
+        ),
+        (
+            'GEMINI_API_KEY="quoted-with-comment" # commentaire prod\n',
+            "quoted-with-comment",
+        ),
+        (
+            "GEMINI_API_KEY='single-with-comment'   # commentaire\n",
+            "single-with-comment",
+        ),
+        (
+            "GEMINI_API_KEY=plain-with-comment # commentaire\n",
+            "plain-with-comment",
+        ),
+        (
+            "GEMINI_API_KEY=key#non-comment\n",
+            "key#non-comment",
         ),
     ],
 )
@@ -625,15 +665,14 @@ def test_http_post_json_invalid_or_non_object_http_response(
 # --- 5. Validation Pydantic ---
 
 
-@pytest.mark.parametrize("verdict", ["ACHAT", "CONSERVER", "VENDRE"])
-@pytest.mark.parametrize("score", [1, 5, 10])
-def test_stock_evaluation_accepts_valid_verdicts_and_scores(
-    verdict: Verdict, score: int
-) -> None:
+@pytest.mark.parametrize("score", range(0, 11))
+def test_stock_evaluation_accepts_valid_verdicts_and_scores(score: int) -> None:
+    verdict = expected_verdict_for_score(score)
     evaluation = StockEvaluation(
         symbol="AAPL",
         verdict=verdict,
         score=score,
+        comment="Avis concis sur l'action.",
         summary="Synthèse factuelle.",
         strengths=["Point fort"],
         risks=["Risque"],
@@ -642,20 +681,65 @@ def test_stock_evaluation_accepts_valid_verdicts_and_scores(
 
     assert evaluation.verdict == verdict
     assert evaluation.score == score
+    assert evaluation.comment == "Avis concis sur l'action."
     with pytest.raises(ValidationError):
         setattr(evaluation, "verdict", "VENDRE")
+
+
+@pytest.mark.parametrize(
+    ("score", "incoherent_verdict"),
+    [
+        (0, "CONSERVER"),
+        (3, "ACHAT"),
+        (4, "VENDRE"),
+        (6, "ACHAT"),
+        (7, "CONSERVER"),
+        (10, "VENDRE"),
+    ],
+)
+def test_stock_evaluation_rejects_incoherent_score_and_verdict(
+    score: int, incoherent_verdict: Verdict
+) -> None:
+    data: dict[str, Any] = {
+        **_valid_evaluation_payload(score=score, verdict=incoherent_verdict),
+        "symbol": "AAPL",
+        "model": DEFAULT_GEMINI_MODEL,
+    }
+    with pytest.raises(ValidationError, match="incohérent"):
+        StockEvaluation.model_validate(data)
+
+    response = _gemini_response_from_text(
+        json.dumps(_valid_evaluation_payload(score=score, verdict=incoherent_verdict))
+    )
+    evaluator = GeminiStockEvaluator(
+        api_key="test-key",
+        http_client=lambda url, payload, headers, timeout: response,
+    )
+    with pytest.raises(EvaluationError) as exc_info:
+        evaluator.evaluate(_sample_stock())
+    assert isinstance(exc_info.value.__cause__, ValidationError)
 
 
 @pytest.mark.parametrize(
     "invalid_fields",
     [
         {"verdict": "HOLD"},
-        {"score": 0},
+        {"score": -1},
         {"score": 11},
         {"score": True},
         {"score": False},
         {"score": 7.5},
         {"score": "haut"},
+        {"comment": None},
+        {"comment": ""},
+        {"comment": "   \t\n  "},
+        {"comment": 123},
+        {"comment": ["liste"]},
+        {"comment": True},
+        {"summary": ""},
+        {"summary": "   "},
+        {"symbol": "  "},
+        {"model": ""},
         {"strengths": "pas une liste"},
     ],
 )
@@ -675,7 +759,7 @@ def test_stock_evaluation_direct_validation_rejects_invalid_values(
 
 @pytest.mark.parametrize(
     "missing_field",
-    ["symbol", "verdict", "score", "summary", "strengths", "risks", "model"],
+    ["symbol", "verdict", "score", "comment", "summary", "strengths", "risks", "model"],
 )
 def test_stock_evaluation_direct_validation_rejects_missing_fields(missing_field: str) -> None:
     data: dict[str, Any] = {
@@ -693,13 +777,23 @@ def test_stock_evaluation_direct_validation_rejects_missing_fields(missing_field
     "bad_gemini_payload",
     [
         _valid_evaluation_payload(verdict="HOLD"),
-        _valid_evaluation_payload(score=0),
+        _valid_evaluation_payload(score=-1),
         _valid_evaluation_payload(score=11),
         _valid_evaluation_payload(score=True),
+        _valid_evaluation_payload(score=False),
+        _valid_evaluation_payload(comment=123),
         _valid_evaluation_payload(strengths="Croissance forte"),
         {
             "verdict": "ACHAT",
             "score": 8,
+            "summary": "Synthèse sans commentaire.",
+            "strengths": ["Point fort"],
+            "risks": ["Risque"],
+        },
+        {
+            "verdict": "ACHAT",
+            "score": 8,
+            "comment": "Commentaire sans synthèse.",
             "strengths": ["Point fort"],
             "risks": ["Risque"],
         },
@@ -716,6 +810,130 @@ def test_evaluate_wraps_pydantic_validation_error(bad_gemini_payload: dict[str, 
         evaluator.evaluate(_sample_stock())
 
     assert isinstance(exc_info.value.__cause__, ValidationError)
+
+
+def test_stock_evaluation_comment_normalizes_whitespace_and_keeps_exact_limit() -> None:
+    exact_comment = "a" * MAX_COMMENT_LENGTH
+    eval_exact = StockEvaluation(
+        symbol="AAPL",
+        verdict="CONSERVER",
+        score=5,
+        comment=exact_comment,
+        summary="Synthèse.",
+        strengths=["Solidité"],
+        risks=["Concurrence"],
+        model=DEFAULT_GEMINI_MODEL,
+    )
+    assert eval_exact.comment == exact_comment
+    assert len(eval_exact.comment) == MAX_COMMENT_LENGTH
+
+    eval_whitespace = StockEvaluation(
+        symbol="AAPL",
+        verdict="ACHAT",
+        score=8,
+        comment="  Croissance\tsoutenue \n  et   marges  solides.  ",
+        summary="Synthèse.",
+        strengths=["Solidité"],
+        risks=["Concurrence"],
+        model=DEFAULT_GEMINI_MODEL,
+    )
+    assert eval_whitespace.comment == "Croissance soutenue et marges solides."
+
+
+@pytest.mark.parametrize(
+    "long_comment",
+    [
+        " ".join(["croissance"] * 30),
+        "x" * 260,
+        "Marges solides, " * 20,
+    ],
+)
+def test_stock_evaluation_comment_truncates_with_ellipsis_within_limit(long_comment: str) -> None:
+    evaluation = StockEvaluation(
+        symbol="NVDA",
+        verdict="ACHAT",
+        score=9,
+        comment=long_comment,
+        summary="Synthèse.",
+        strengths=["Point fort"],
+        risks=["Risque"],
+        model=DEFAULT_GEMINI_MODEL,
+    )
+
+    assert len(evaluation.comment) <= MAX_COMMENT_LENGTH
+    assert evaluation.comment.endswith("…")
+    assert not evaluation.comment[:-1].endswith(" ")
+
+
+def test_stock_evaluation_comment_truncation_avoids_splitting_word_when_possible() -> None:
+    # Construit une phrase qui franchit la limite de 200 caractères au milieu du mot "valorisation".
+    prefix = " ".join(["fondamentaux"] * 15)  # 194 caractères
+    long_comment = f"{prefix} valorisation attractive"
+    assert len(long_comment) > MAX_COMMENT_LENGTH
+
+    evaluation = StockEvaluation(
+        symbol="NVDA",
+        verdict="ACHAT",
+        score=8,
+        comment=long_comment,
+        summary="Synthèse.",
+        strengths=["Point fort"],
+        risks=["Risque"],
+        model=DEFAULT_GEMINI_MODEL,
+    )
+
+    assert evaluation.comment == f"{prefix}…"
+    assert len(evaluation.comment) <= MAX_COMMENT_LENGTH
+
+
+@pytest.mark.parametrize(
+    ("verdict", "score", "expected_label"),
+    [
+        ("ACHAT", 8, "Achat"),
+        ("CONSERVER", 5, "Conserver"),
+        ("VENDRE", 2, "Vendre"),
+    ],
+)
+def test_format_verdict_and_decision_label(
+    verdict: Verdict, score: int, expected_label: str
+) -> None:
+    assert format_verdict(verdict) == expected_label
+
+    evaluation = StockEvaluation(
+        symbol="NVDA",
+        verdict=verdict,
+        score=score,
+        comment="Avis neutre.",
+        summary="Synthèse.",
+        strengths=["Point fort"],
+        risks=["Risque"],
+        model=DEFAULT_GEMINI_MODEL,
+    )
+    assert evaluation.decision_label == expected_label
+
+
+def test_evaluation_response_schema_and_prompt_specifications() -> None:
+    properties = _EVALUATION_RESPONSE_SCHEMA["properties"]
+    assert properties["score"]["type"] == "INTEGER"
+    assert properties["score"]["minimum"] == 0
+    assert properties["score"]["maximum"] == 10
+    assert properties["comment"]["type"] == "STRING"
+    assert "comment" in _EVALUATION_RESPONSE_SCHEMA["required"]
+    assert set(_EVALUATION_RESPONSE_SCHEMA["required"]) == {
+        "verdict",
+        "score",
+        "comment",
+        "summary",
+        "strengths",
+        "risks",
+    }
+
+    prompt = _build_evaluation_prompt(_sample_stock(), analysis_date="2026-11-21")
+    assert "0 (très défavorable) et 10 (très favorable)" in prompt
+    assert "0-3 => VENDRE" in prompt
+    assert "4-6 => CONSERVER" in prompt
+    assert "7-10 => ACHAT" in prompt
+    assert f"comment : avis concis en français ({MAX_COMMENT_LENGTH} caractères maximum)" in prompt
 
 
 # --- 6. Validation des paramètres de configuration ---
@@ -1011,3 +1229,200 @@ def test_evaluate_enables_google_search_by_default_and_extracts_sources() -> Non
         "Reuters (https://reuters.com/nvda)",
         "https://bloomberg.com/nvda",
     ]
+
+
+# --- 8. Résilience lecture HTTP (ConnectionError/SSL pendant read & taille max) ---
+
+
+@pytest.mark.parametrize(
+    "read_exc",
+    [
+        ConnectionResetError("connection reset by peer"),
+        ssl.SSLEOFError("EOF occurred in violation of protocol"),
+    ],
+)
+def test_http_post_json_retries_transient_connection_or_ssl_error_during_read(
+    monkeypatch: pytest.MonkeyPatch, read_exc: Exception
+) -> None:
+    attempts = 0
+    delays: list[float] = []
+
+    class _FlakyBodyResponse:
+        def __enter__(self) -> "_FlakyBodyResponse":
+            return self
+
+        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+            return None
+
+        def read(self, amt: int | None = None) -> bytes:
+            raise read_exc
+
+    def fake_urlopen(request: urllib.request.Request, timeout: int) -> Any:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return _FlakyBodyResponse()
+        return _FakeHTTPResponse(json.dumps({"ok": True}).encode("utf-8"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    result = http_post_json(
+        url="https://api.example.test/generate",
+        payload={"a": 1},
+        headers={},
+        timeout=10,
+        max_retries=2,
+        backoff_seconds=0.5,
+        sleep=delays.append,
+    )
+
+    assert result == {"ok": True}
+    assert attempts == 2
+    assert delays == [0.5]
+
+
+@pytest.mark.parametrize(
+    "ssl_exc",
+    [
+        urllib.error.URLError(ssl.SSLCertVerificationError("certificate verify failed")),
+        ssl.SSLCertVerificationError("certificate verify failed"),
+    ],
+)
+def test_http_post_json_does_not_retry_ssl_cert_verification_error(
+    monkeypatch: pytest.MonkeyPatch,
+    ssl_exc: Exception,
+) -> None:
+    attempts = 0
+    delays: list[float] = []
+
+    def fake_urlopen(request: urllib.request.Request, timeout: int) -> Any:
+        nonlocal attempts
+        attempts += 1
+        raise ssl_exc
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    with pytest.raises(EvaluationError, match="Erreur réseau"):
+        http_post_json(
+            url="https://api.example.test/generate",
+            payload={"a": 1},
+            headers={},
+            timeout=10,
+            max_retries=2,
+            backoff_seconds=0.5,
+            sleep=delays.append,
+        )
+
+    assert attempts == 1
+    assert delays == []
+
+
+def test_evaluate_retries_once_on_incoherent_score_verdict_and_succeeds() -> None:
+    captured_prompts: list[str] = []
+    responses = [
+        _gemini_response_from_text(json.dumps(_valid_evaluation_payload(score=6, verdict="ACHAT"))),
+        _gemini_response_from_text(
+            json.dumps(_valid_evaluation_payload(score=6, verdict="CONSERVER"))
+        ),
+    ]
+
+    def fake_http_client(
+        url: str,
+        payload: dict[str, Any],
+        headers: dict[str, str],
+        timeout: int,
+    ) -> dict[str, Any]:
+        captured_prompts.append(payload["contents"][0]["parts"][0]["text"])
+        return responses.pop(0)
+
+    evaluator = GeminiStockEvaluator(
+        api_key="test-key",
+        http_client=fake_http_client,
+        max_validation_retries=1,
+    )
+
+    result = evaluator.evaluate(_sample_stock())
+
+    assert len(captured_prompts) == 2
+    assert "échoué à la validation" not in captured_prompts[0]
+    assert "échoué à la validation" in captured_prompts[1]
+    assert result.score == 6
+    assert result.verdict == "CONSERVER"
+
+
+def test_evaluate_retries_on_invalid_json_and_validates_max_validation_retries() -> None:
+    calls = 0
+
+    def fake_http_client(
+        url: str,
+        payload: dict[str, Any],
+        headers: dict[str, str],
+        timeout: int,
+    ) -> dict[str, Any]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _gemini_response_from_text("{not valid json")
+        return _gemini_response_from_text(json.dumps(_valid_evaluation_payload()))
+
+    evaluator = GeminiStockEvaluator(
+        api_key="test-key",
+        http_client=fake_http_client,
+        max_validation_retries=1,
+    )
+    result = evaluator.evaluate(_sample_stock())
+    assert calls == 2
+    assert result.verdict == "ACHAT"
+
+    calls_no_retry = 0
+
+    def failing_client(
+        url: str,
+        payload: dict[str, Any],
+        headers: dict[str, str],
+        timeout: int,
+    ) -> dict[str, Any]:
+        nonlocal calls_no_retry
+        calls_no_retry += 1
+        return _gemini_response_from_text("{not valid json")
+
+    no_retry_evaluator = GeminiStockEvaluator(
+        api_key="test-key",
+        http_client=failing_client,
+        max_validation_retries=0,
+    )
+    with pytest.raises(EvaluationError, match="JSON invalide"):
+        no_retry_evaluator.evaluate(_sample_stock())
+    assert calls_no_retry == 1
+
+    for bad_retries in (-1, True, False):
+        with pytest.raises(EvaluationError, match="max_validation_retries"):
+            GeminiStockEvaluator(api_key="test-key", max_validation_retries=bad_retries)
+
+
+def test_http_post_json_rejects_oversized_response_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    read_sizes: list[int | None] = []
+
+    class _LargeResponse:
+        def __enter__(self) -> "_LargeResponse":
+            return self
+
+        def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+            return None
+
+        def read(self, amt: int | None = None) -> bytes:
+            read_sizes.append(amt)
+            return b"x" * (amt if amt is not None else 1024)
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: _LargeResponse())
+
+    with pytest.raises(EvaluationError, match="trop volumineuse"):
+        http_post_json(
+            url="https://api.example.test/generate",
+            payload={"a": 1},
+            headers={},
+            timeout=10,
+            max_response_bytes=64,
+        )
+
+    assert read_sizes == [65]

@@ -12,6 +12,7 @@ from typing import Any, Protocol
 from harness._http import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_RETRY_BACKOFF_SECONDS,
+    MAX_RESPONSE_BYTES,
     read_env_file_key,
     request_json,
     sanitize_error_message,
@@ -79,6 +80,7 @@ def http_json(
     *,
     max_retries: int = DEFAULT_MAX_RETRIES,
     backoff_seconds: float = DEFAULT_RETRY_BACKOFF_SECONDS,
+    max_response_bytes: int = MAX_RESPONSE_BYTES,
     sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
     """Envoie une requête HTTP GET ou POST JSON avec retry sur erreurs transitoires."""
@@ -90,6 +92,7 @@ def http_json(
         error_cls=ProviderError,
         max_retries=max_retries,
         backoff_seconds=backoff_seconds,
+        max_response_bytes=max_response_bytes,
         sleep=sleep,
         logger_instance=logger,
     )
