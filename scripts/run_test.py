@@ -19,7 +19,7 @@ def main(argv: list[str] | None = None) -> int:
     import pytest
 
     extra_args = list(argv) if argv is not None else sys.argv[1:]
-    return pytest.main(["-v", str(ROOT / "tests"), str(ROOT / "harness" / "tests"), *extra_args])
+    return pytest.main(["-v", str(ROOT / "tests"), *extra_args])
 
 
 if __name__ == "__main__":

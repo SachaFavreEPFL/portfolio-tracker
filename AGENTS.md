@@ -9,7 +9,8 @@ Outil Python CLI mono-utilisateur de suivi de portefeuille d'actions, développ�
   - `market_data.py` : fournisseur `yfinance` avec cache JSON local (TTL 24h, écriture atomique).
 - `tests/` : tests unitaires isolés (`pytest`, mocks, `tmp_path`, aucun appel réseau réel).
 - `scripts/` : lanceurs pratiques (`run.py` pour l'exécution réelle, `run_test.py` pour `pytest`).
-- `harness/` : outillage IA et vérifications automatiques (`check.py`).
+- `harness/` : boucle de vérification déterministe (`check.py` : `ruff`, `mypy`, `pytest`).
+- `.agents/skills/` : rôles d'agents utilisables directement depuis le chat (`coder`, `test`, `doc`, `audit`, `orchestrator`).
 
 ## Conventions
 - Python `>=3.11`, annotations de types complètes (`str | None`, `list[str]`, etc.).
