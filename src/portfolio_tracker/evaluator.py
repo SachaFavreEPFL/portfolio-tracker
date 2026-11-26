@@ -59,7 +59,7 @@ _EVALUATION_RESPONSE_SCHEMA: dict[str, Any] = {
         "score": {
             "type": "INTEGER",
             "minimum": 0,
-            "maximum": 10,
+            "maximum": 100,
         },
         "comment": {
             "type": "STRING",
@@ -158,10 +158,13 @@ def _build_evaluation_prompt(
         "pondère ton verdict et ton score si l'actualité récente remet en cause la dynamique historique.\n"
         f"{date_line}"
         "- verdict : exactement une valeur parmi ACHAT, CONSERVER ou VENDRE.\n"
-        "- score : entier compris entre 0 (très défavorable) et 10 (très favorable).\n"
-        "- Cohérence stricte entre score et verdict : 0-3 => VENDRE, 4-6 => CONSERVER, 7-10 => ACHAT.\n"
-        f"- comment : avis concis en français ({MAX_COMMENT_LENGTH} caractères maximum) "
-        "résumant la thèse et la décision pour un tableur.\n"
+        "- score : entier compris entre 0 (très défavorable) et 100 (très favorable). "
+        "Utilise toute l'étendue de l'échelle pour différencier nettement les dossiers "
+        "(évite de concentrer les notes par prudence autour de 55-65).\n"
+        "- Cohérence stricte entre score et verdict : 0-39 => VENDRE, 40-69 => CONSERVER, 70-100 => ACHAT.\n"
+        f"- comment : avis concis et purement analytique en français ({MAX_COMMENT_LENGTH} caractères maximum) "
+        "résumant la thèse (valorisation, catalyseurs, risques) pour un tableur, sans répéter "
+        "la note ni la décision (Achat/Conserver/Vendre) qui figurent déjà dans d'autres colonnes.\n"
         "- summary : synthèse concise et factuelle intégrant fondamentaux et actualité récente.\n"
         "- strengths : liste des principaux points forts observables.\n"
         "- risks : liste des principaux risques ou points de vigilance.\n\n"
@@ -310,7 +313,7 @@ class GeminiStockEvaluator(StockEvaluator):
                     f"{base_prompt}\n\n"
                     "ATTENTION : ta réponse précédente a échoué à la validation "
                     f"({last_validation_note}). Respecte strictement le schéma JSON et "
-                    "la correspondance exacte 0-3 => VENDRE, 4-6 => CONSERVER, 7-10 => ACHAT."
+                    "la correspondance exacte 0-39 => VENDRE, 40-69 => CONSERVER, 70-100 => ACHAT."
                 )
 
             payload: dict[str, Any] = {

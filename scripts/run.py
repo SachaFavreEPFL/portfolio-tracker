@@ -152,7 +152,7 @@ def _run_numbers_mode(args: argparse.Namespace) -> int:
         if item.ok:
             completed_rows += 1
             print(
-                f"[{index}/{total}] {item.symbol} — Note : {item.score}/10 | {item.decision}",
+                f"[{index}/{total}] {item.symbol} — Note : {item.score}/100 | {item.decision}",
                 file=sys.stderr,
             )
         else:
@@ -203,7 +203,7 @@ def _run_numbers_mode(args: argparse.Namespace) -> int:
         if item.ok:
             print(
                 f"  [OK] {item.symbol} — "
-                f"Note : {item.score}/10 | Décision : {item.decision} | {item.comment}"
+                f"Note : {item.score}/100 | Décision : {item.decision} | {item.comment}"
             )
         else:
             print(

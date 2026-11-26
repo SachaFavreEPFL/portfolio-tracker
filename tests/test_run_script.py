@@ -28,7 +28,7 @@ def _sample_evaluation(symbol: str = "NVDA") -> StockEvaluation:
     return StockEvaluation(
         symbol=symbol,
         verdict="ACHAT",
-        score=8,
+        score=80,
         comment="Croissance solide et marges robustes.",
         summary="Fondamentaux solides.",
         strengths=["Croissance"],
@@ -180,7 +180,7 @@ def test_run_main_numbers_mode_success_in_place_and_decision_column_created(
                 PortfolioRowResult(
                     row_index=1,
                     symbol="UNM",
-                    score=8,
+                    score=80,
                     comment="Rentabilité solide.",
                     decision="Achat",
                 )
@@ -207,7 +207,7 @@ def test_run_main_numbers_mode_success_in_place_and_decision_column_created(
     out = capsys.readouterr().out
     assert f"Fichier sauvegardé : {input_file}" in out
     assert "Colonne « Décision » créée automatiquement." in out
-    assert "[OK] UNM — Note : 8/10 | Décision : Achat | Rentabilité solide." in out
+    assert "[OK] UNM — Note : 80/100 | Décision : Achat | Rentabilité solide." in out
     assert "Total : 1 succès, 0 erreur(s)." in out
 
 
@@ -231,7 +231,7 @@ def test_run_main_numbers_mode_success_with_output_and_force_refresh(
                 PortfolioRowResult(
                     row_index=1,
                     symbol="PEP",
-                    score=5,
+                    score=50,
                     comment="Défensif mais valorisé.",
                     decision="Conserver",
                 )
@@ -280,7 +280,7 @@ def test_run_main_numbers_mode_partial_row_error_returns_one(
                 PortfolioRowResult(
                     row_index=1,
                     symbol="UNM",
-                    score=8,
+                    score=80,
                     comment="Solide.",
                     decision="Achat",
                 ),
@@ -485,14 +485,14 @@ def test_run_main_numbers_mode_end_to_end_with_real_numbers_file(
 
     assert exit_code == 0
     captured = capsys.readouterr()
-    assert "[1/1] NVDA — Note : 8/10 | Achat" in captured.err
+    assert "[1/1] NVDA — Note : 80/100 | Achat" in captured.err
     assert f"Fichier sauvegardé : {numbers_file}" in captured.out
     assert "Total : 1 succès, 0 erreur(s)." in captured.out
 
     reloaded = Document(str(numbers_file))
     out_table = reloaded.sheets[0].tables[0]
     assert out_table.cell(0, 3).value == "Décision"
-    assert out_table.cell(1, 1).value == 8
+    assert out_table.cell(1, 1).value == 80
     assert out_table.cell(1, 2).value == "Croissance solide et marges robustes."
     assert out_table.cell(1, 3).value == "Achat"
     assert out_table.cell(2, 1).value is None

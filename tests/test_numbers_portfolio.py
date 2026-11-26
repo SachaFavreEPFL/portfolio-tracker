@@ -194,19 +194,19 @@ def test_update_creates_decision_in_first_empty_column_and_preserves_rows(
         "UNM": _make_evaluation(
             "UNM",
             verdict="ACHAT",
-            score=8,
+            score=80,
             comment="Assureur rentable avec valorisation modérée.",
         ),
         "MO": _make_evaluation(
             "MO",
             verdict="CONSERVER",
-            score=5,
+            score=50,
             comment="Dividende élevé mais volumes en repli progressif.",
         ),
         "PEP": _make_evaluation(
             "PEP",
             verdict="VENDRE",
-            score=2,
+            score=20,
             comment="Pression sur les marges et valorisation tendue.",
         ),
     }
@@ -240,7 +240,7 @@ def test_update_creates_decision_in_first_empty_column_and_preserves_rows(
     assert table.cell(1, 0).value == "UNM"
     assert table.cell(1, 1).value == pytest.approx(12)
     assert table.cell(1, 2).value == pytest.approx(45.5)
-    assert table.cell(1, 3).value == 8
+    assert table.cell(1, 3).value == 80
     assert table.cell(1, 4).value == "Assureur rentable avec valorisation modérée."
     assert len(str(table.cell(1, 4).value)) <= MAX_COMMENT_LENGTH
     assert table.cell(1, 5).value == "Assurance"
@@ -253,7 +253,7 @@ def test_update_creates_decision_in_first_empty_column_and_preserves_rows(
     assert table.cell(3, 0).value == "MO"
     assert table.cell(3, 1).value == pytest.approx(30)
     assert table.cell(3, 2).value == pytest.approx(42.0)
-    assert table.cell(3, 3).value == 5
+    assert table.cell(3, 3).value == pytest.approx(50)
     assert table.cell(3, 4).value == "Dividende élevé mais volumes en repli progressif."
     assert table.cell(3, 5).value == "Tabac"
     assert table.cell(3, 6).value == "Conserver"
@@ -262,7 +262,7 @@ def test_update_creates_decision_in_first_empty_column_and_preserves_rows(
     assert table.cell(4, 0).value == "PEP"
     assert table.cell(4, 1).value == pytest.approx(8)
     assert table.cell(4, 2).value == pytest.approx(165.25)
-    assert table.cell(4, 3).value == 2
+    assert table.cell(4, 3).value == 20
     assert table.cell(4, 4).value == "Pression sur les marges et valorisation tendue."
     assert table.cell(4, 5).value == "Boissons"
     assert table.cell(4, 6).value == "Vendre"
@@ -290,7 +290,7 @@ def test_update_preserves_other_sheets_intact(tmp_path: Path) -> None:
     evaluator.evaluate.return_value = _make_evaluation(
         "UNM",
         verdict="ACHAT",
-        score=8,
+        score=80,
         comment="Solide.",
     )
 
@@ -322,7 +322,7 @@ def test_update_appends_decision_column_when_no_empty_column_exists_after_commen
     evaluator.evaluate.return_value = _make_evaluation(
         "UNM",
         verdict="ACHAT",
-        score=9,
+        score=90,
         comment="Solide génération de trésorerie.",
     )
 
@@ -339,7 +339,7 @@ def test_update_appends_decision_column_when_no_empty_column_exists_after_commen
     table = reloaded.sheets[0].tables[0]
     assert table.num_cols == 5
     assert table.cell(0, 4).value == DECISION_HEADER
-    assert table.cell(1, 2).value == 9
+    assert table.cell(1, 2).value == 90
     assert table.cell(1, 3).value == "Solide génération de trésorerie."
     assert table.cell(1, 4).value == "Achat"
 
@@ -365,7 +365,7 @@ def test_update_reuses_existing_decision_column_case_and_accent_insensitive(
     evaluator.evaluate.return_value = _make_evaluation(
         "PEP",
         verdict="CONSERVER",
-        score=6,
+        score=60,
         comment="Nouvel avis mis à jour.",
     )
 
@@ -380,7 +380,7 @@ def test_update_reuses_existing_decision_column_case_and_accent_insensitive(
     table = reloaded.sheets[0].tables[0]
     assert table.num_cols == 4
     assert table.cell(0, 3).value == existing_decision_header
-    assert table.cell(1, 1).value == 6
+    assert table.cell(1, 1).value == 60
     assert table.cell(1, 2).value == "Nouvel avis mis à jour."
     assert table.cell(1, 3).value == "Conserver"
 
@@ -413,7 +413,7 @@ def test_update_tolerates_row_errors_and_continues_processing_other_rows(tmp_pat
             return _make_evaluation(
                 "UNM",
                 verdict="ACHAT",
-                score=10,
+                score=100,
                 comment="Excellents fondamentaux.",
             )
         return _make_evaluation(
@@ -445,7 +445,7 @@ def test_update_tolerates_row_errors_and_continues_processing_other_rows(tmp_pat
 
     reloaded = Document(str(numbers_file))
     table = reloaded.sheets[0].tables[0]
-    assert table.cell(1, 1).value == 10
+    assert table.cell(1, 1).value == 100
     assert table.cell(1, 3).value == "Achat"
     # La ligne en erreur garde ses anciennes valeurs intactes.
     assert table.cell(2, 1).value == 4
@@ -473,7 +473,7 @@ def test_update_saves_to_output_path_without_modifying_input_file(tmp_path: Path
     evaluator.evaluate.return_value = _make_evaluation(
         "UNM",
         verdict="ACHAT",
-        score=7,
+        score=70,
         comment="Valorisation attractive.",
     )
 
@@ -495,7 +495,7 @@ def test_update_saves_to_output_path_without_modifying_input_file(tmp_path: Path
     reloaded_output = Document(str(output_file))
     out_table = reloaded_output.sheets[0].tables[0]
     assert out_table.cell(0, 3).value == DECISION_HEADER
-    assert out_table.cell(1, 1).value == 7
+    assert out_table.cell(1, 1).value == 70
     assert out_table.cell(1, 2).value == "Valorisation attractive."
     assert out_table.cell(1, 3).value == "Achat"
 
@@ -516,7 +516,7 @@ def test_update_atomic_in_place_save_leaves_no_temporary_files(tmp_path: Path) -
     evaluator.evaluate.return_value = _make_evaluation(
         "MO",
         verdict="CONSERVER",
-        score=5,
+        score=50,
         comment="Rendement stable.",
     )
 
@@ -531,7 +531,7 @@ def test_update_atomic_in_place_save_leaves_no_temporary_files(tmp_path: Path) -
     assert [entry.name for entry in work_dir.iterdir()] == ["suivi.numbers"]
 
     reloaded = Document(str(target_file))
-    assert reloaded.sheets[0].tables[0].cell(1, 1).value == 5
+    assert reloaded.sheets[0].tables[0].cell(1, 1).value == pytest.approx(50)
 
 
 @pytest.mark.parametrize("force_refresh", [False, True])
@@ -551,7 +551,7 @@ def test_update_propagates_force_refresh_to_provider(
     evaluator.evaluate.return_value = _make_evaluation(
         "UNM",
         verdict="ACHAT",
-        score=8,
+        score=80,
         comment="Très bon profil.",
     )
 
@@ -732,7 +732,7 @@ def test_read_and_update_apple_numbers_package_format_in_place_and_output(tmp_pa
     evaluator.evaluate.return_value = _make_evaluation(
         "UNM",
         verdict="ACHAT",
-        score=8,
+        score=80,
         comment="Paquet Numbers mis à jour.",
     )
 
@@ -746,7 +746,7 @@ def test_read_and_update_apple_numbers_package_format_in_place_and_output(tmp_pa
     assert result_out.saved is True
     assert output_pkg.is_dir()
     reloaded_out = Document(str(output_pkg))
-    assert reloaded_out.sheets[0].tables[0].cell(1, 1).value == 8
+    assert reloaded_out.sheets[0].tables[0].cell(1, 1).value == 80
     assert reloaded_out.sheets[0].tables[0].cell(1, 3).value == "Achat"
 
     result_inplace = update_numbers_portfolio(
@@ -758,7 +758,7 @@ def test_read_and_update_apple_numbers_package_format_in_place_and_output(tmp_pa
     assert pkg_path.is_dir()
     assert [entry.name for entry in pkg_dir.iterdir()] == ["portfolio.numbers"]
     reloaded_inplace = Document(str(pkg_path))
-    assert reloaded_inplace.sheets[0].tables[0].cell(1, 1).value == 8
+    assert reloaded_inplace.sheets[0].tables[0].cell(1, 1).value == 80
     assert reloaded_inplace.sheets[0].tables[0].cell(1, 2).value == "Paquet Numbers mis à jour."
 
 
@@ -781,7 +781,7 @@ def test_update_preserves_file_permissions_and_follows_symlink(tmp_path: Path) -
     evaluator.evaluate.return_value = _make_evaluation(
         "UNM",
         verdict="ACHAT",
-        score=9,
+        score=90,
         comment="Permissions et symlink préservés.",
     )
 
@@ -791,7 +791,7 @@ def test_update_preserves_file_permissions_and_follows_symlink(tmp_path: Path) -
     assert link_file.resolve() == real_file.resolve()
     assert stat.S_IMODE(real_file.stat().st_mode) == 0o644
     reloaded = Document(str(real_file))
-    assert reloaded.sheets[0].tables[0].cell(1, 1).value == 9
+    assert reloaded.sheets[0].tables[0].cell(1, 1).value == 90
 
 
 def test_read_and_update_respect_multi_header_rows_and_ignore_summary_or_numeric_rows(
@@ -825,7 +825,7 @@ def test_read_and_update_respect_multi_header_rows_and_ignore_summary_or_numeric
     evaluator.evaluate.return_value = _make_evaluation(
         "UNM",
         verdict="ACHAT",
-        score=8,
+        score=80,
         comment="En-tête ligne 1 respecté.",
     )
 
@@ -841,7 +841,7 @@ def test_read_and_update_respect_multi_header_rows_and_ignore_summary_or_numeric
     # L'en-tête Décision doit être créé sur la ligne d'en-tête réelle (1), pas sur le titre (0).
     assert reloaded_table.cell(0, 3).value is None
     assert reloaded_table.cell(1, 3).value == DECISION_HEADER
-    assert reloaded_table.cell(2, 1).value == 8
+    assert reloaded_table.cell(2, 1).value == 80
     assert reloaded_table.cell(2, 3).value == "Achat"
     # La ligne Total ne doit pas avoir été touchée.
     assert reloaded_table.cell(4, 1).value == pytest.approx(99)
@@ -921,7 +921,7 @@ def test_update_protects_formula_cells_in_col_zero_and_target_columns(
     evaluator.evaluate.side_effect = lambda stock: _make_evaluation(
         stock.symbol,
         verdict="CONSERVER",
-        score=5,
+        score=50,
         comment="Ok.",
     )
 
@@ -937,7 +937,7 @@ def test_update_protects_formula_cells_in_col_zero_and_target_columns(
     reloaded_table = reloaded.sheets[0].tables[0]
     assert reloaded_table.cell(2, 1).value == 7
     assert reloaded_table.cell(2, 2).value == "Ancien"
-    assert reloaded_table.cell(3, 1).value == 5
+    assert reloaded_table.cell(3, 1).value == pytest.approx(50)
 
 
 def test_update_deduplicates_identical_symbols_within_single_run(tmp_path: Path) -> None:
@@ -964,7 +964,7 @@ def test_update_deduplicates_identical_symbols_within_single_run(tmp_path: Path)
     evaluator.evaluate.return_value = _make_evaluation(
         "AAPL",
         verdict="ACHAT",
-        score=8,
+        score=80,
         comment="Évaluation unique partagée.",
     )
 
@@ -982,8 +982,8 @@ def test_update_deduplicates_identical_symbols_within_single_run(tmp_path: Path)
 
     reloaded = Document(str(numbers_file))
     table = reloaded.sheets[0].tables[0]
-    assert table.cell(1, 1).value == 8
-    assert table.cell(3, 1).value == 8
+    assert table.cell(1, 1).value == 80
+    assert table.cell(3, 1).value == 80
     assert table.cell(1, 2).value == table.cell(3, 2).value == "Évaluation unique partagée."
     assert table.cell(1, 3).value == table.cell(3, 3).value == "Achat"
 
@@ -1020,7 +1020,7 @@ def test_update_aborts_without_saving_on_partial_table_write_failure(
     evaluator.evaluate.side_effect = lambda stock: _make_evaluation(
         stock.symbol,
         verdict="ACHAT",
-        score=9,
+        score=90,
         comment="Nouveau commentaire.",
     )
 
@@ -1072,7 +1072,7 @@ def test_update_saves_completed_rows_on_keyboard_interrupt_and_reports_progress(
     evaluator.evaluate.return_value = _make_evaluation(
         "UNM",
         verdict="ACHAT",
-        score=8,
+        score=80,
         comment="Sauvegardé avant interruption.",
     )
 
@@ -1089,7 +1089,7 @@ def test_update_saves_completed_rows_on_keyboard_interrupt_and_reports_progress(
     assert progress_events == [("UNM", 1, 2)]
     reloaded = Document(str(numbers_file))
     table = reloaded.sheets[0].tables[0]
-    assert table.cell(1, 1).value == 8
+    assert table.cell(1, 1).value == 80
     assert table.cell(1, 2).value == "Sauvegardé avant interruption."
     assert table.cell(2, 1).value is None
 
@@ -1126,7 +1126,7 @@ def test_update_does_not_save_partially_mutated_row_on_keyboard_interrupt_mid_wr
     evaluator.evaluate.side_effect = lambda stock: _make_evaluation(
         stock.symbol,
         verdict="ACHAT",
-        score=9,
+        score=90,
         comment="Nouveau commentaire.",
     )
 
@@ -1355,7 +1355,7 @@ def test_update_skips_column_with_merged_cell_when_creating_decision_column(tmp_
     evaluator.evaluate.side_effect = lambda stock: _make_evaluation(
         stock.symbol,
         verdict="ACHAT",
-        score=8,
+        score=80,
         comment=f"Avis {stock.symbol}.",
     )
 
@@ -1374,7 +1374,7 @@ def test_update_skips_column_with_merged_cell_when_creating_decision_column(tmp_
     assert out_table.cell(0, 4).value == DECISION_HEADER
     assert out_table.cell(1, 1).value == 5
     assert out_table.cell(1, 2).value == "Commentaire fusionné"
-    assert out_table.cell(2, 1).value == 8
+    assert out_table.cell(2, 1).value == 80
     assert out_table.cell(2, 2).value == "Avis NVDA."
     assert out_table.cell(2, 4).value == "Achat"
 
@@ -1427,7 +1427,7 @@ def test_update_skips_row_when_target_cell_is_merged_without_calling_provider(
     evaluator.evaluate.side_effect = lambda stock: _make_evaluation(
         stock.symbol,
         verdict="CONSERVER",
-        score=6,
+        score=60,
         comment="Évaluation NVDA.",
     )
 
@@ -1445,7 +1445,7 @@ def test_update_skips_row_when_target_cell_is_merged_without_calling_provider(
     # La ligne fusionnée AAPL reste intacte et la ligne NVDA est mise à jour.
     assert out_table.cell(1, 1).value == 5
     assert out_table.cell(1, 2).value == "Ancien commentaire"
-    assert out_table.cell(2, 1).value == 6
+    assert out_table.cell(2, 1).value == 60
     assert out_table.cell(2, 2).value == "Évaluation NVDA."
     assert out_table.cell(2, 3).value == "Conserver"
 
@@ -1478,7 +1478,7 @@ def test_update_protects_vertical_and_cross_column_merge_anchor_cells(tmp_path: 
     evaluator.evaluate.side_effect = lambda stock: _make_evaluation(
         stock.symbol,
         verdict="ACHAT",
-        score=9,
+        score=90,
         comment=f"Avis {stock.symbol}.",
     )
 
@@ -1498,6 +1498,6 @@ def test_update_protects_vertical_and_cross_column_merge_anchor_cells(tmp_path: 
     assert out_table.cell(1, 1).value == 7
     assert out_table.cell(1, 2).value == "Note partagée"
     assert out_table.cell(3, 2).value == "Fusion avec secteur"
-    assert out_table.cell(4, 1).value == 9
+    assert out_table.cell(4, 1).value == 90
     assert out_table.cell(4, 2).value == "Avis PEP."
     assert out_table.cell(4, 4).value == "Achat"

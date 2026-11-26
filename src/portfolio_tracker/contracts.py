@@ -20,10 +20,10 @@ def format_verdict(verdict: Verdict) -> str:
 
 
 def expected_verdict_for_score(score: int) -> Verdict:
-    """Retourne le verdict canonique attendu pour un score compris entre 0 et 10."""
-    if score <= 3:
+    """Retourne le verdict canonique attendu pour un score compris entre 0 et 100."""
+    if score <= 39:
         return "VENDRE"
-    if score <= 6:
+    if score <= 69:
         return "CONSERVER"
     return "ACHAT"
 
@@ -65,7 +65,7 @@ class StockEvaluation(BaseModel):
 
     symbol: str
     verdict: Verdict
-    score: int = Field(ge=0, le=10)
+    score: int = Field(ge=0, le=100)
     comment: str
     summary: str
     strengths: list[str]
@@ -88,7 +88,7 @@ class StockEvaluation(BaseModel):
     def _reject_bool_score(cls, value: Any) -> Any:
         # En Python, bool est une sous-classe de int : True/False ne doivent pas passer comme 1/0.
         if isinstance(value, bool):
-            raise ValueError("Le score doit être un entier compris entre 0 et 10, pas un booléen.")
+            raise ValueError("Le score doit être un entier compris entre 0 et 100, pas un booléen.")
         return value
 
     @field_validator("comment", mode="before")
@@ -116,7 +116,7 @@ class StockEvaluation(BaseModel):
         if self.verdict != expected:
             raise ValueError(
                 f"Verdict '{self.verdict}' incohérent avec le score {self.score} "
-                f"(attendu : '{expected}' pour 0-3=VENDRE, 4-6=CONSERVER, 7-10=ACHAT)."
+                f"(attendu : '{expected}' pour 0-39=VENDRE, 40-69=CONSERVER, 70-100=ACHAT)."
             )
         return self
 

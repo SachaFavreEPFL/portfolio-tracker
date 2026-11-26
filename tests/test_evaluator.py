@@ -54,7 +54,7 @@ def _sample_stock() -> StockData:
 def _valid_evaluation_payload(**overrides: Any) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "verdict": "ACHAT",
-        "score": 8,
+        "score": 80,
         "comment": "Croissance IA très soutenue et marges élevées, valorisation exigeante.",
         "summary": "Croissance exceptionnelle et marges très élevées.",
         "strengths": ["Forte croissance du chiffre d'affaires", "Marges nettes élevées"],
@@ -145,7 +145,7 @@ def test_evaluate_success_checks_request_and_returns_stock_evaluation() -> None:
     assert schema["type"] == "OBJECT"
     assert schema["properties"]["verdict"]["enum"] == ["ACHAT", "CONSERVER", "VENDRE"]
     assert schema["properties"]["score"]["minimum"] == 0
-    assert schema["properties"]["score"]["maximum"] == 10
+    assert schema["properties"]["score"]["maximum"] == 100
     assert schema["properties"]["comment"]["type"] == "STRING"
     assert set(schema["required"]) == {
         "verdict",
@@ -160,7 +160,7 @@ def test_evaluate_success_checks_request_and_returns_stock_evaluation() -> None:
     assert result.symbol == "NVDA"
     assert result.verdict == "ACHAT"
     assert result.decision_label == "Achat"
-    assert result.score == 8
+    assert result.score == 80
     assert (
         result.comment
         == "Croissance IA très soutenue et marges élevées, valorisation exigeante."
@@ -171,14 +171,14 @@ def test_evaluate_success_checks_request_and_returns_stock_evaluation() -> None:
     assert result.model == "gemini-4-neon"
 
     with pytest.raises(ValidationError):
-        setattr(result, "score", 5)
+        setattr(result, "score", 50)
 
 
 def test_evaluate_ignores_thought_parts_and_uses_final_json() -> None:
     response = _gemini_response_from_parts(
         [
             {"thought": True, "text": "Réflexion interne qui n'est pas du JSON valide {["},
-            {"text": json.dumps(_valid_evaluation_payload(verdict="CONSERVER", score=6))},
+            {"text": json.dumps(_valid_evaluation_payload(verdict="CONSERVER", score=60))},
         ]
     )
 
@@ -190,7 +190,7 @@ def test_evaluate_ignores_thought_parts_and_uses_final_json() -> None:
     result = evaluator.evaluate(_sample_stock())
 
     assert result.verdict == "CONSERVER"
-    assert result.score == 6
+    assert result.score == 60
     assert result.model == DEFAULT_GEMINI_MODEL
 
 
@@ -665,7 +665,7 @@ def test_http_post_json_invalid_or_non_object_http_response(
 # --- 5. Validation Pydantic ---
 
 
-@pytest.mark.parametrize("score", range(0, 11))
+@pytest.mark.parametrize("score", range(0, 101))
 def test_stock_evaluation_accepts_valid_verdicts_and_scores(score: int) -> None:
     verdict = expected_verdict_for_score(score)
     evaluation = StockEvaluation(
@@ -690,11 +690,11 @@ def test_stock_evaluation_accepts_valid_verdicts_and_scores(score: int) -> None:
     ("score", "incoherent_verdict"),
     [
         (0, "CONSERVER"),
-        (3, "ACHAT"),
-        (4, "VENDRE"),
-        (6, "ACHAT"),
-        (7, "CONSERVER"),
-        (10, "VENDRE"),
+        (39, "ACHAT"),
+        (40, "VENDRE"),
+        (69, "ACHAT"),
+        (70, "CONSERVER"),
+        (100, "VENDRE"),
     ],
 )
 def test_stock_evaluation_rejects_incoherent_score_and_verdict(
@@ -725,10 +725,10 @@ def test_stock_evaluation_rejects_incoherent_score_and_verdict(
     [
         {"verdict": "HOLD"},
         {"score": -1},
-        {"score": 11},
+        {"score": 101},
         {"score": True},
         {"score": False},
-        {"score": 7.5},
+        {"score": 75.5},
         {"score": "haut"},
         {"comment": None},
         {"comment": ""},
@@ -778,21 +778,21 @@ def test_stock_evaluation_direct_validation_rejects_missing_fields(missing_field
     [
         _valid_evaluation_payload(verdict="HOLD"),
         _valid_evaluation_payload(score=-1),
-        _valid_evaluation_payload(score=11),
+        _valid_evaluation_payload(score=101),
         _valid_evaluation_payload(score=True),
         _valid_evaluation_payload(score=False),
         _valid_evaluation_payload(comment=123),
         _valid_evaluation_payload(strengths="Croissance forte"),
         {
             "verdict": "ACHAT",
-            "score": 8,
+            "score": 80,
             "summary": "Synthèse sans commentaire.",
             "strengths": ["Point fort"],
             "risks": ["Risque"],
         },
         {
             "verdict": "ACHAT",
-            "score": 8,
+            "score": 80,
             "comment": "Commentaire sans synthèse.",
             "strengths": ["Point fort"],
             "risks": ["Risque"],
@@ -817,7 +817,7 @@ def test_stock_evaluation_comment_normalizes_whitespace_and_keeps_exact_limit() 
     eval_exact = StockEvaluation(
         symbol="AAPL",
         verdict="CONSERVER",
-        score=5,
+        score=50,
         comment=exact_comment,
         summary="Synthèse.",
         strengths=["Solidité"],
@@ -830,7 +830,7 @@ def test_stock_evaluation_comment_normalizes_whitespace_and_keeps_exact_limit() 
     eval_whitespace = StockEvaluation(
         symbol="AAPL",
         verdict="ACHAT",
-        score=8,
+        score=80,
         comment="  Croissance\tsoutenue \n  et   marges  solides.  ",
         summary="Synthèse.",
         strengths=["Solidité"],
@@ -852,7 +852,7 @@ def test_stock_evaluation_comment_truncates_with_ellipsis_within_limit(long_comm
     evaluation = StockEvaluation(
         symbol="NVDA",
         verdict="ACHAT",
-        score=9,
+        score=90,
         comment=long_comment,
         summary="Synthèse.",
         strengths=["Point fort"],
@@ -874,7 +874,7 @@ def test_stock_evaluation_comment_truncation_avoids_splitting_word_when_possible
     evaluation = StockEvaluation(
         symbol="NVDA",
         verdict="ACHAT",
-        score=8,
+        score=80,
         comment=long_comment,
         summary="Synthèse.",
         strengths=["Point fort"],
@@ -889,9 +889,9 @@ def test_stock_evaluation_comment_truncation_avoids_splitting_word_when_possible
 @pytest.mark.parametrize(
     ("verdict", "score", "expected_label"),
     [
-        ("ACHAT", 8, "Achat"),
-        ("CONSERVER", 5, "Conserver"),
-        ("VENDRE", 2, "Vendre"),
+        ("ACHAT", 80, "Achat"),
+        ("CONSERVER", 50, "Conserver"),
+        ("VENDRE", 20, "Vendre"),
     ],
 )
 def test_format_verdict_and_decision_label(
@@ -916,7 +916,7 @@ def test_evaluation_response_schema_and_prompt_specifications() -> None:
     properties = _EVALUATION_RESPONSE_SCHEMA["properties"]
     assert properties["score"]["type"] == "INTEGER"
     assert properties["score"]["minimum"] == 0
-    assert properties["score"]["maximum"] == 10
+    assert properties["score"]["maximum"] == 100
     assert properties["comment"]["type"] == "STRING"
     assert "comment" in _EVALUATION_RESPONSE_SCHEMA["required"]
     assert set(_EVALUATION_RESPONSE_SCHEMA["required"]) == {
@@ -929,11 +929,15 @@ def test_evaluation_response_schema_and_prompt_specifications() -> None:
     }
 
     prompt = _build_evaluation_prompt(_sample_stock(), analysis_date="2026-11-21")
-    assert "0 (très défavorable) et 10 (très favorable)" in prompt
-    assert "0-3 => VENDRE" in prompt
-    assert "4-6 => CONSERVER" in prompt
-    assert "7-10 => ACHAT" in prompt
-    assert f"comment : avis concis en français ({MAX_COMMENT_LENGTH} caractères maximum)" in prompt
+    assert "0 (très défavorable) et 100 (très favorable)" in prompt
+    assert "0-39 => VENDRE" in prompt
+    assert "40-69 => CONSERVER" in prompt
+    assert "70-100 => ACHAT" in prompt
+    assert (
+        f"comment : avis concis et purement analytique en français ({MAX_COMMENT_LENGTH} caractères maximum)"
+        in prompt
+    )
+    assert "sans répéter la note ni la décision" in prompt
 
 
 # --- 6. Validation des paramètres de configuration ---
@@ -1320,9 +1324,9 @@ def test_http_post_json_does_not_retry_ssl_cert_verification_error(
 def test_evaluate_retries_once_on_incoherent_score_verdict_and_succeeds() -> None:
     captured_prompts: list[str] = []
     responses = [
-        _gemini_response_from_text(json.dumps(_valid_evaluation_payload(score=6, verdict="ACHAT"))),
+        _gemini_response_from_text(json.dumps(_valid_evaluation_payload(score=60, verdict="ACHAT"))),
         _gemini_response_from_text(
-            json.dumps(_valid_evaluation_payload(score=6, verdict="CONSERVER"))
+            json.dumps(_valid_evaluation_payload(score=60, verdict="CONSERVER"))
         ),
     ]
 
@@ -1346,7 +1350,7 @@ def test_evaluate_retries_once_on_incoherent_score_verdict_and_succeeds() -> Non
     assert len(captured_prompts) == 2
     assert "échoué à la validation" not in captured_prompts[0]
     assert "échoué à la validation" in captured_prompts[1]
-    assert result.score == 6
+    assert result.score == 60
     assert result.verdict == "CONSERVER"
 
 
